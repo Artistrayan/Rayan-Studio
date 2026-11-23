@@ -48,17 +48,46 @@ export interface Model3DMetadata {
   nodeCount?: number;
 }
 
+export interface AssetDependencyRef {
+  id: string;
+  relativePath: string;
+  kind: 'texture' | 'material' | 'binary';
+  mimeType: string;
+  sizeBytes: number;
+  checksumSha256?: string;
+}
+
+export interface AssetVersionEntry {
+  version: number;
+  updatedAt: number;
+  sizeBytes: number;
+  checksumSha256: string;
+  note?: string;
+}
+
 export interface RayanAsset {
   id: string;
   name: string;
   kind: AssetKind;
   format: AssetFormat;
-  /** Data URL for images & audio, or base64 / idb reference for binary 3D models */
+  /** Data URL for images & audio, or base64 / idb://<id> reference for large binary models */
   dataUrl: string;
   sizeBytes: number;
   createdAt: number;
   modelMeta?: Model3DMetadata;
   storedInIdb?: boolean;
+  sourceUrl?: string;
+  tags?: string[];
+  width?: number;
+  height?: number;
+  durationSeconds?: number;
+  version?: number;
+  checksumSha256?: string;
+  chunkCount?: number;
+  dependencies?: AssetDependencyRef[];
+  linkedSceneNodeIds?: string[];
+  linkedSceneIds?: string[];
+  versionHistory?: AssetVersionEntry[];
 }
 
 export type Primitive3DType =
@@ -178,6 +207,56 @@ export interface EntityAnimationConfig {
   spriteCols: number;
   spriteRows: number;
   fps: number;
+  idleRow?: number;
+  walkRow?: number;
+  jumpRow?: number;
+  actionRow?: number;
+  idleClip?: string;
+  walkClip?: string;
+  jumpClip?: string;
+  actionClip?: string;
+}
+
+export type EntityBehaviorMode =
+  | 'none'
+  | 'patrol'
+  | 'chase'
+  | 'flee'
+  | 'orbit'
+  | 'turret-shoot'
+  | 'moving-platform'
+  | 'collectible-bob'
+  | 'hazard-damage'
+  | 'bounce-pad'
+  | 'scene-portal'
+  | 'checkpoint';
+
+export interface EntityBehaviorConfig {
+  mode: EntityBehaviorMode;
+  speed?: number;
+  range?: number;
+  targetName?: string;
+  intervalSeconds?: number;
+  amount?: number;
+  nextSceneId?: string;
+  message?: string;
+}
+
+export interface EntityCollisionConfig {
+  response: 'solid' | 'trigger' | 'none';
+  filterRole?: EntityRole | 'any';
+  onCollideAction?:
+    | 'none'
+    | 'collect'
+    | 'damage'
+    | 'bounce'
+    | 'destroy-other'
+    | 'destroy-self'
+    | 'next-scene'
+    | 'go-to-scene';
+  actionAmount?: number;
+  targetSceneId?: string;
+  sound?: string;
 }
 
 export interface GameEntity {
@@ -205,6 +284,8 @@ export interface GameEntity {
   physics: PhysicsConfig;
   textConfig?: TextConfig;
   animation?: EntityAnimationConfig;
+  behavior?: EntityBehaviorConfig;
+  collisionConfig?: EntityCollisionConfig;
 }
 
 export type ParticlePreset = 'explosion' | 'sparkle' | 'smoke' | 'snow' | 'rain';
@@ -345,6 +426,82 @@ export interface CodeFileItem {
   updatedAt: number;
 }
 
+export type LayoutMode = 'free' | 'flex-col' | 'flex-row' | 'grid';
+export type BreakpointMode = 'desktop' | 'tablet' | 'mobile';
+export type UIElementType =
+  | 'button'
+  | 'text'
+  | 'image'
+  | 'icon'
+  | 'card'
+  | 'container'
+  | 'progressBar'
+  | 'badge'
+  | 'input'
+  | 'list';
+
+export type UIActionBinding =
+  | 'navigate'
+  | 'add-var'
+  | 'set-var'
+  | 'db-save'
+  | 'db-load'
+  | 'db-clear'
+  | 'play-sound'
+  | 'show-message';
+
+export interface UIElement {
+  id: string;
+  type: UIElementType;
+  label: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  zIndex?: number;
+  bgColor: string;
+  textColor: string;
+  borderColor?: string;
+  borderRadius: number;
+  fontSize: number;
+  padding?: number;
+  opacity?: number;
+  imageAssetId?: string;
+  iconName?: string;
+  bindVar?: string;
+  placeholder?: string;
+  collectionId?: string;
+  actionType?: UIActionBinding;
+  actionParam?: string;
+  actionValue?: string;
+}
+
+export interface UIPage {
+  id: string;
+  name: string;
+  isHome?: boolean;
+  layoutMode: LayoutMode;
+  gap: number;
+  gridCols: number;
+  bgColor: string;
+  elements: UIElement[];
+}
+
+export interface UIDataCollection {
+  id: string;
+  name: string;
+  fields: string[];
+}
+
+export interface UIDataRecord {
+  id: string;
+  projectId: string;
+  collectionId: string;
+  data: Record<string, string | number | boolean>;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface RayanProject {
   id: string;
   name: string;
@@ -356,6 +513,10 @@ export interface RayanProject {
   studio3dNodes?: SceneNode3D[];
   /** Custom code files (.js, .ts, .css, .html, .json, etc.) */
   codeFiles?: CodeFileItem[];
+  /** Visual UI App Builder pages & IndexedDB data collections */
+  uiPages?: UIPage[];
+  activeUiPageId?: string;
+  uiCollections?: UIDataCollection[];
   /** Mirrors the active scene for convenience & backward compatibility */
   environment: EnvironmentConfig;
   entities: GameEntity[];

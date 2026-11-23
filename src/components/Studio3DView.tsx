@@ -60,9 +60,9 @@ import {
   buildProceduralPresetGroup,
   disposeObject3D,
   loadCustom3DAsset,
-  parseAndInspect3DModelFile,
 } from '../engine/threeModels';
-import { arrayBufferToDataUrl, saveAssetToDb } from '../storage/projectDb';
+import { importAssetsFromFileList } from '../engine/assetManager';
+import { linkAssetToScene, unlinkAssetFromScene } from '../storage/projectDb';
 
 export type { SceneNode3D };
 
@@ -859,6 +859,17 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
         });
       }
 
+      const removedPairs: Array<{ nodeId: string; assetId: string }> = [];
+      nodesRef.current.forEach((n) => {
+        if (toRemove.has(n.id) && n.assetId) {
+          removedPairs.push({ nodeId: n.id, assetId: n.assetId });
+        }
+      });
+
+      removedPairs.forEach((pair) => {
+        void unlinkAssetFromScene(pair.assetId, pair.nodeId).catch(() => {});
+      });
+
       toRemove.forEach((id) => {
         const obj = modelObjectsRef.current.get(id);
         if (obj) {
@@ -877,11 +888,19 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
       setSelectedIds((prev) => prev.filter((id) => !toRemove.has(id)));
       setNodes((prev) => {
         const next = prev.filter((n) => !toRemove.has(n.id));
-        persistNodesToProject(next);
+        onUpdateProject?.((proj) => ({
+          ...proj,
+          studio3dNodes: next,
+          assets: proj.assets.map((a) => ({
+            ...a,
+            linkedSceneNodeIds: (a.linkedSceneNodeIds || []).filter((nid) => !toRemove.has(nid)),
+          })),
+          updatedAt: Date.now(),
+        }));
         return next;
       });
     },
-    [persistNodesToProject]
+    [onUpdateProject]
   );
 
   // Add Basic Primitive
@@ -1005,9 +1024,24 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
       animations: asset.modelMeta?.animationNames,
     };
 
+    void linkAssetToScene(asset.id, project.activeSceneId, id).catch(() => {});
+
     setNodes((prev) => {
       const next = [...prev, newNode];
-      persistNodesToProject(next);
+      onUpdateProject?.((proj) => ({
+        ...proj,
+        studio3dNodes: next,
+        assets: proj.assets.map((a) =>
+          a.id === asset.id
+            ? {
+                ...a,
+                linkedSceneIds: Array.from(new Set([...(a.linkedSceneIds || []), proj.activeSceneId])),
+                linkedSceneNodeIds: Array.from(new Set([...(a.linkedSceneNodeIds || []), id])),
+              }
+            : a
+        ),
+        updatedAt: Date.now(),
+      }));
       return next;
     });
     setSelectedIds([id]);
@@ -1016,77 +1050,45 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
     }
   };
 
-  // Handle uploaded 3D files (GLB, glTF, FBX, OBJ, STL, USD, USDZ, PLY)
+  // Handle uploaded 3D files & companion textures/MTL/BIN/ZIP via IndexedDB v3 asset pipeline
   const handleImport3DFiles = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
     setImportError(null);
-    setImportStatus(null);
+    setImportStatus(`در حال خواندن و ذخیره ${files.length} فایل و وابستگی‌ها در IndexedDB...`);
 
     const addedNodeIds: string[] = [];
+    const newNodes: SceneNode3D[] = [];
 
-    for (const file of Array.from(files)) {
-      const ext = file.name.split('.').pop()?.toLowerCase() || '';
-      if (!['glb', 'gltf', 'fbx', 'obj', 'stl', 'usd', 'usdz', 'ply'].includes(ext)) {
-        setImportError(`فرمت فایل «${file.name}» مجاز نیست.`);
-        continue;
+    try {
+      const result = await importAssetsFromFileList(files);
+      if (result.errors.length > 0) {
+        setImportError(result.errors.join(' | '));
       }
 
-      try {
-        setImportStatus(`در حال خواندن و بارگذاری «${file.name}»...`);
-        const buffer = await file.arrayBuffer();
-        if (!buffer || buffer.byteLength === 0) {
-          throw new Error('فایل خالی است.');
+      for (const asset of result.assets) {
+        if (asset.kind !== 'model3d') {
+          await onAddAsset?.(asset);
+          continue;
         }
-
-        const format = ext as AssetFormat;
-        const mimeType =
-          format === 'glb'
-            ? 'model/gltf-binary'
-            : format === 'gltf'
-              ? 'model/gltf+json'
-              : 'application/octet-stream';
-        const dataUrl = arrayBufferToDataUrl(buffer, mimeType);
-
-        const parsed = await parseAndInspect3DModelFile(buffer, format, '#38bdf8');
-        const assetId = `asset_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-        const assetName = file.name.replace(/\.[^.]+$/, '');
-
-        await saveAssetToDb({
-          id: assetId,
-          name: assetName,
-          kind: 'model3d',
-          format,
-          sizeBytes: file.size,
-          createdAt: Date.now(),
-          buffer,
-          dataUrl,
-          modelMeta: parsed.meta,
-        });
-
-        const newAsset: RayanAsset = {
-          id: assetId,
-          name: assetName,
-          kind: 'model3d',
-          format,
-          dataUrl,
-          sizeBytes: file.size,
-          createdAt: Date.now(),
-          modelMeta: parsed.meta,
-          storedInIdb: true,
-        };
-
-        await onAddAsset?.(newAsset);
 
         const nodeId = `node_model_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
         const spawnX = Number(((Math.random() - 0.5) * 3).toFixed(2));
         const spawnZ = Number(((Math.random() - 0.5) * 3).toFixed(2));
 
+        await linkAssetToScene(asset.id, project.activeSceneId, nodeId).catch(() => {});
+        const linkedAsset: RayanAsset = {
+          ...asset,
+          linkedSceneIds: [project.activeSceneId],
+          linkedSceneNodeIds: [nodeId],
+        };
+        await onAddAsset?.(linkedAsset);
+
         const newNode: SceneNode3D = {
           id: nodeId,
-          name: assetName,
+          name: asset.name,
           kind: 'model-asset',
-          assetId,
-          format: ext.toUpperCase(),
+          assetId: asset.id,
+          format: asset.format.toUpperCase(),
           position: [spawnX, 0, spawnZ],
           rotation: [0, 0, 0],
           scale: [1, 1, 1],
@@ -1095,33 +1097,40 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
           locked: false,
           parentId: null,
           layerId: 'characters',
-          animations: parsed.meta.animationNames,
+          animations: asset.modelMeta?.animationNames,
         };
 
         addedNodeIds.push(nodeId);
-        setNodes((prev) => {
-          const next = [...prev, newNode];
-          persistNodesToProject(next);
-          return next;
-        });
+        newNodes.push(newNode);
 
         if (orbitRef.current) {
           orbitRef.current.target.set(spawnX, 0.75, spawnZ);
         }
-
-        setImportStatus(
-          `مدل «${assetName}» (${parsed.meta.vertexCount ?? 0} رأس) بارگذاری و ذخیره شد و به صحنه اضافه گردید.`
-        );
-      } catch (err) {
-        setImportStatus(null);
-        setImportError(
-          `خطا در بارگذاری مدل «${file.name}»: ${err instanceof Error ? err.message : 'فرمت یا ساختار نامعتبر'}`
-        );
       }
-    }
 
-    if (addedNodeIds.length > 0) {
-      setSelectedIds(addedNodeIds);
+      if (newNodes.length > 0) {
+        setNodes((prev) => {
+          const next = [...prev, ...newNodes];
+          persistNodesToProject(next);
+          return next;
+        });
+        setSelectedIds(addedNodeIds);
+        const totalVerts = result.assets
+          .filter((a) => a.kind === 'model3d')
+          .reduce((sum, a) => sum + (a.modelMeta?.vertexCount || 0), 0);
+        setImportStatus(
+          `${newNodes.length} مدل (${totalVerts.toLocaleString()} رأس) در binary_assets ذخیره و به صحنه اضافه شد.`
+        );
+      } else if (result.assets.length > 0) {
+        setImportStatus(`${result.assets.length} دارایی در کتابخانه ذخیره شد.`);
+      } else if (result.errors.length === 0) {
+        setImportStatus(null);
+      }
+    } catch (err) {
+      setImportStatus(null);
+      setImportError(
+        `خطا در بارگذاری مدل: ${err instanceof Error ? err.message : 'فرمت یا ساختار نامعتبر'}`
+      );
     }
   };
 

@@ -16,10 +16,14 @@ import { buildProceduralPresetGroup, loadCustom3DAsset } from './threeModels';
 import type { RuntimeStatsPayload } from './Engine2D';
 import { BoxLayersRenderer } from '../components/BoxLayersRenderer';
 import {
-  compileRuntimeScripts,
-  type CompiledScriptHandle,
-  type ScriptRuntimeApi,
+  createGameScriptSession,
+  type GameScriptWorkerSession,
 } from './customScriptRunner';
+import type { HookCommandBatch } from '../runtime/workers/javascriptWorker';
+import {
+  getDefaultCollisionConfig,
+  pickModel3DAnimationClip,
+} from './gameRuntimeHelpers';
 
 interface Engine3DProps {
   project: RayanProject;
@@ -34,10 +38,14 @@ interface Engine3DProps {
 interface Sim3DBody {
   entity: GameEntity;
   object3D: THREE.Object3D;
+  startX: number;
   baseY: number;
+  startZ: number;
   vx: number;
   vy: number;
   vz: number;
+  lastStepDx: number;
+  lastStepDz: number;
   alive: boolean;
   onGround: boolean;
   facingX: number;
@@ -45,6 +53,10 @@ interface Sim3DBody {
   patrolDir: number;
   orbitAngle: number;
   animTime: number;
+  mixer?: THREE.AnimationMixer;
+  actions?: Map<string, THREE.AnimationAction>;
+  availableClips: string[];
+  activeClip?: string | null;
 }
 
 interface Projectile3D {
@@ -151,8 +163,9 @@ export const Engine3D: React.FC<Engine3DProps> = ({
   const [clickedBoxId, setClickedBoxId] = useState<string | null>(null);
   const lastScrollRuleRef = useRef<Map<string, number>>(new Map());
   const suppressNextClickRef = useRef(false);
-  const compiledScriptsRef = useRef<CompiledScriptHandle[]>([]);
+  const scriptSessionRef = useRef<GameScriptWorkerSession | null>(null);
   const scriptsStartedRef = useRef(false);
+  const scriptStepAccRef = useRef(0);
   const [debugBadge, setDebugBadge] = useState({
     fps: 60,
     entities: project.entities.length,
@@ -357,13 +370,41 @@ export const Engine3D: React.FC<Engine3DProps> = ({
         boxHelpersRef.current.push(helper);
       }
 
+      const clips = (obj3D.userData.animations as THREE.AnimationClip[] | undefined) || [];
+      let mixer: THREE.AnimationMixer | undefined;
+      let actions: Map<string, THREE.AnimationAction> | undefined;
+      const availableClips: string[] = [];
+      let activeClip: string | null = null;
+      if (clips.length > 0) {
+        mixer = new THREE.AnimationMixer(obj3D);
+        actions = new Map<string, THREE.AnimationAction>();
+        clips.forEach((clip) => {
+          const cname = clip.name || `Clip_${availableClips.length + 1}`;
+          availableClips.push(cname);
+          actions!.set(cname, mixer!.clipAction(clip));
+        });
+        const initialClip =
+          pickModel3DAnimationClip(ent.animation, availableClips, 'idle') || availableClips[0];
+        if (initialClip && actions.get(initialClip)) {
+          actions.get(initialClip)!.play();
+          activeClip = initialClip;
+        }
+      }
+
       simMapRef.current.set(ent.id, {
-        entity: { ...ent },
+        entity: {
+          ...ent,
+          collisionConfig: ent.collisionConfig || getDefaultCollisionConfig(ent.role),
+        },
         object3D: obj3D,
+        startX: ent.x,
         baseY: ent.y,
+        startZ: ent.z,
         vx: 0,
         vy: 0,
         vz: 0,
+        lastStepDx: 0,
+        lastStepDz: 0,
         alive: true,
         onGround: ent.y <= 0.05,
         facingX: 0,
@@ -371,6 +412,10 @@ export const Engine3D: React.FC<Engine3DProps> = ({
         patrolDir: 1,
         orbitAngle: 0,
         animTime: Math.random() * 3,
+        mixer,
+        actions,
+        availableClips,
+        activeClip,
       });
     }
 
@@ -463,20 +508,24 @@ export const Engine3D: React.FC<Engine3DProps> = ({
       void syncSceneEntities(scene, activeScene, project);
     }
 
+    scriptSessionRef.current?.dispose();
+    scriptSessionRef.current = null;
+    scriptsStartedRef.current = false;
+    scriptStepAccRef.current = 0;
+
     if (isPlaying) {
       audioEngine.startBgm(project.soundBindings.bgm, project.assets);
-      compiledScriptsRef.current = compileRuntimeScripts(project.codeFiles, (fname, errMsg) => {
+      scriptSessionRef.current = createGameScriptSession(project.codeFiles, (fname, errMsg) => {
         logsRef.current = [`خطای کد ${fname}: ${errMsg}`, ...logsRef.current.slice(0, 14)];
       });
-      scriptsStartedRef.current = false;
     } else {
       audioEngine.stopBgm();
-      compiledScriptsRef.current = [];
-      scriptsStartedRef.current = false;
     }
 
     return () => {
       audioEngine.stopBgm();
+      scriptSessionRef.current?.dispose();
+      scriptSessionRef.current = null;
     };
   }, [
     project.activeSceneId,
@@ -860,13 +909,31 @@ export const Engine3D: React.FC<Engine3DProps> = ({
             };
             void buildSingleEntityMesh(clonedEnt, projectRef.current).then((obj) => {
               scene.add(obj);
+              const clips = (obj.userData.animations as THREE.AnimationClip[] | undefined) || [];
+              let mixer: THREE.AnimationMixer | undefined;
+              let actions: Map<string, THREE.AnimationAction> | undefined;
+              const availableClips: string[] = [];
+              if (clips.length > 0) {
+                mixer = new THREE.AnimationMixer(obj);
+                actions = new Map();
+                clips.forEach((c) => {
+                  const cname = c.name || `Clip_${availableClips.length + 1}`;
+                  availableClips.push(cname);
+                  actions!.set(cname, mixer!.clipAction(c));
+                });
+                actions.values().next().value?.play();
+              }
               simMapRef.current.set(clonedEnt.id, {
                 entity: clonedEnt,
                 object3D: obj,
+                startX: clonedEnt.x,
                 baseY: clonedEnt.y,
+                startZ: clonedEnt.z,
                 vx: 0,
                 vy: 0,
                 vz: 0,
+                lastStepDx: 0,
+                lastStepDz: 0,
                 alive: true,
                 onGround: false,
                 facingX: 0,
@@ -874,6 +941,10 @@ export const Engine3D: React.FC<Engine3DProps> = ({
                 patrolDir: 1,
                 orbitAngle: 0,
                 animTime: 0,
+                mixer,
+                actions,
+                availableClips,
+                activeClip: availableClips[0] || null,
               });
               spawn3DParticles(scene, obj.position, 'sparkle', 10);
             });
@@ -1047,87 +1118,82 @@ export const Engine3D: React.FC<Engine3DProps> = ({
         const curScene = runtimeSceneRef.current;
         const sims = Array.from(simMapRef.current.values());
 
-        if (compiledScriptsRef.current.length > 0) {
-          const scriptApi: ScriptRuntimeApi = {
-            get score() {
-              return varsRef.current.score;
-            },
-            setScore: (val) => {
-              varsRef.current.score = val;
-            },
-            addScore: (delta) => {
-              varsRef.current.score += delta;
-            },
-            get health() {
-              return varsRef.current.health;
-            },
-            setHealth: (val) => {
-              varsRef.current.health = Math.max(0, val);
-            },
-            get vars() {
-              return varsRef.current.custom;
-            },
-            setVar: (name, val) => {
-              varsRef.current.custom[name] = val;
-            },
-            get elapsed() {
-              return elapsedRef.current;
-            },
-            findEntity: (name) => {
-              const found = sims.find((s) => s.alive && s.entity.name === name);
-              if (!found) return null;
-              return {
-                name: found.entity.name,
-                x: found.object3D.position.x,
-                y: found.object3D.position.y,
-                z: found.object3D.position.z,
-                vx: found.vx,
-                vy: found.vy,
-                visible: found.object3D.visible,
-              };
-            },
-            moveEntity: (name, vx, vy, vz = 0) => {
-              const found = sims.find((s) => s.alive && s.entity.name === name);
+        const session = scriptSessionRef.current;
+        if (session?.active) {
+          const applyHookBatch = (batch: HookCommandBatch) => {
+            if (batch.setScore !== undefined) varsRef.current.score = batch.setScore;
+            if (batch.scoreDelta) varsRef.current.score += batch.scoreDelta;
+            if (batch.setHealth !== undefined) varsRef.current.health = Math.max(0, batch.setHealth);
+            for (const [k, v] of Object.entries(batch.varPatches || {})) {
+              varsRef.current.custom[k] = Number(v);
+            }
+            for (const mv of batch.moves || []) {
+              const found = sims.find((s) => s.alive && s.entity.name === mv.name);
               if (found) {
-                found.vx = vx;
-                found.vy = vy;
-                found.vz = vz;
+                found.vx = mv.vx;
+                found.vy = mv.vy;
+                found.vz = mv.vz ?? 0;
               }
-            },
-            setEntityPosition: (name, x, y, z = 0) => {
-              const found = sims.find((s) => s.alive && s.entity.name === name);
+            }
+            for (const pos of batch.positions || []) {
+              const found = sims.find((s) => s.alive && s.entity.name === pos.name);
               if (found) {
-                found.object3D.position.set(x, y, z);
+                found.object3D.position.set(pos.x, pos.y, pos.z ?? found.object3D.position.z);
               }
-            },
-            showMessage: (msg) => setBannerMessage(String(msg)),
-            playSound: (name) => audioEngine.playSound(name, projectRef.current.assets),
-            spawnParticles: () => {},
-            log: (msg) => {
-              logsRef.current = [String(msg), ...logsRef.current.slice(0, 14)];
-            },
+            }
+            for (const pt of batch.particles || []) {
+              spawn3DParticles(
+                scene,
+                new THREE.Vector3(pt.x, pt.y, 0),
+                (pt.preset || 'sparkle') as ParticlePreset,
+                16
+              );
+            }
+            for (const snd of batch.sounds || []) {
+              audioEngine.playSound(snd, projectRef.current.assets);
+            }
+            if (batch.messages?.length) {
+              setBannerMessage(batch.messages[batch.messages.length - 1]);
+            }
+            if (batch.logs?.length) {
+              logsRef.current = [...batch.logs.slice().reverse(), ...logsRef.current].slice(0, 14);
+            }
+          };
+
+          const snapshot = {
+            score: varsRef.current.score,
+            health: varsRef.current.health,
+            vars: { ...varsRef.current.custom },
+            elapsed: elapsedRef.current,
+            entities: sims
+              .filter((s) => s.alive)
+              .map((s) => ({
+                name: s.entity.name,
+                x: s.object3D.position.x,
+                y: s.object3D.position.y,
+                z: s.object3D.position.z,
+                vx: s.vx,
+                vy: s.vy,
+                visible: s.object3D.visible,
+              })),
           };
 
           if (!scriptsStartedRef.current) {
             scriptsStartedRef.current = true;
-            for (const h of compiledScriptsRef.current) {
-              try {
-                h.onStart?.(scriptApi);
-              } catch {
-                // ignore
-              }
-            }
-          }
-          for (const h of compiledScriptsRef.current) {
-            try {
-              h.onUpdate?.(scriptApi, dt);
-            } catch {
-              // ignore
+            session.runStart(snapshot, applyHookBatch);
+          } else {
+            scriptStepAccRef.current += dt;
+            if (scriptStepAccRef.current >= 0.032) {
+              const stepDt = scriptStepAccRef.current;
+              scriptStepAccRef.current = 0;
+              session.stepUpdate(stepDt, snapshot, applyHookBatch);
             }
           }
         }
 
         sims.forEach((s) => {
+          s.lastStepDx = 0;
+          s.lastStepDz = 0;
           if (!s.alive || s.entity.physics.isStatic) return;
           s.vx *= 0.82;
           s.vz *= 0.82;
@@ -1174,14 +1240,156 @@ export const Engine3D: React.FC<Engine3DProps> = ({
         });
         keysJustPressedRef.current = {};
 
+        // 3D Declarative Entity Behaviors
+        sims.forEach((s) => {
+          if (!s.alive || !s.entity.behavior || s.entity.behavior.mode === 'none') return;
+          const beh = s.entity.behavior;
+          const targetBody =
+            (beh.targetName
+              ? sims.find((t) => t.alive && t.entity.name === beh.targetName)
+              : undefined) || sims.find((t) => t.alive && t.entity.role === 'player');
+
+          switch (beh.mode) {
+            case 'patrol': {
+              const sp = beh.speed ?? 3;
+              const range = beh.range ?? 7;
+              s.vx = sp * s.patrolDir;
+              if (s.object3D.position.x <= s.startX - range) s.patrolDir = 1;
+              if (s.object3D.position.x >= s.startX + range) s.patrolDir = -1;
+              break;
+            }
+            case 'moving-platform': {
+              const sp = beh.speed ?? 2.5;
+              const range = beh.range ?? 6;
+              const prevX = s.object3D.position.x;
+              s.object3D.position.x += sp * s.patrolDir * dt;
+              if (s.object3D.position.x <= s.startX - range) {
+                s.object3D.position.x = s.startX - range;
+                s.patrolDir = 1;
+              } else if (s.object3D.position.x >= s.startX + range) {
+                s.object3D.position.x = s.startX + range;
+                s.patrolDir = -1;
+              }
+              s.lastStepDx = s.object3D.position.x - prevX;
+              break;
+            }
+            case 'chase': {
+              if (!targetBody || targetBody.entity.id === s.entity.id) break;
+              _vec3A.copy(targetBody.object3D.position).sub(s.object3D.position);
+              _vec3A.y = 0;
+              const dist = _vec3A.length();
+              const range = beh.range ?? 24;
+              if (dist > 0.25 && dist <= range) {
+                _vec3A.normalize();
+                const sp = beh.speed ?? 2.8;
+                s.vx = _vec3A.x * sp;
+                s.vz = _vec3A.z * sp;
+                s.object3D.rotation.y = Math.atan2(_vec3A.x, _vec3A.z);
+              }
+              break;
+            }
+            case 'flee': {
+              if (!targetBody || targetBody.entity.id === s.entity.id) break;
+              _vec3A.copy(s.object3D.position).sub(targetBody.object3D.position);
+              _vec3A.y = 0;
+              const dist = _vec3A.length();
+              const range = beh.range ?? 10;
+              if (dist > 0.05 && dist <= range) {
+                _vec3A.normalize();
+                const sp = beh.speed ?? 3.4;
+                s.vx = _vec3A.x * sp;
+                s.vz = _vec3A.z * sp;
+                s.object3D.rotation.y = Math.atan2(_vec3A.x, _vec3A.z);
+              }
+              break;
+            }
+            case 'orbit': {
+              if (!targetBody || targetBody.entity.id === s.entity.id) break;
+              s.orbitAngle += (beh.speed ?? 1.5) * dt;
+              const r = beh.range ?? 4.5;
+              s.object3D.position.x = targetBody.object3D.position.x + Math.cos(s.orbitAngle) * r;
+              s.object3D.position.z = targetBody.object3D.position.z + Math.sin(s.orbitAngle) * r;
+              break;
+            }
+            case 'turret-shoot': {
+              if (!targetBody) break;
+              const key = `beh3d_shoot_${s.entity.id}`;
+              const acc = (timerAcc.get(key) || 0) + dt;
+              const interval = beh.intervalSeconds || 2;
+              if (acc >= interval) {
+                timerAcc.set(key, acc - interval);
+                _vec3A.copy(targetBody.object3D.position).sub(s.object3D.position);
+                const dist = _vec3A.length() || 1;
+                const sp = beh.speed ?? 12;
+                const mesh = new THREE.Mesh(projGeo, projMat);
+                mesh.position.set(
+                  s.object3D.position.x,
+                  s.object3D.position.y + 0.9,
+                  s.object3D.position.z
+                );
+                scene.add(mesh);
+                projectiles.push({
+                  mesh,
+                  vx: (_vec3A.x / dist) * sp,
+                  vy: 2.2,
+                  vz: (_vec3A.z / dist) * sp,
+                  life: 3.5,
+                });
+                audioEngine.playSound(projectRef.current.soundBindings.onThrow || 'throw', projectRef.current.assets);
+              } else {
+                timerAcc.set(key, acc);
+              }
+              break;
+            }
+          }
+        });
+
+        // Compute world Box3 for all 3D static solids / moving platforms
+        const solidBoxes: Array<{ sim: Sim3DBody; box: THREE.Box3 }> = [];
+        for (const sol of sims) {
+          if (!sol.alive || !sol.entity.physics.enabled) continue;
+          const isSolidRole =
+            sol.entity.collisionConfig?.response === 'solid' ||
+            (!sol.entity.collisionConfig && sol.entity.role === 'platform') ||
+            sol.entity.behavior?.mode === 'moving-platform';
+          if (isSolidRole && (sol.entity.physics.isStatic || sol.entity.behavior?.mode === 'moving-platform')) {
+            solidBoxes.push({ sim: sol, box: new THREE.Box3().setFromObject(sol.object3D) });
+          }
+        }
+
         const grav = curScene.environment.gravity || 24;
         sims.forEach((s) => {
           if (!s.alive) return;
           s.animTime += dt;
 
-          if (s.entity.animation?.preset === 'float') {
+          // Update Three.js Skeletal / Keyframe AnimationMixer
+          if (s.mixer && s.actions && s.availableClips.length > 0) {
+            const animState =
+              !s.onGround && s.entity.physics.useGravity
+                ? 'jump'
+                : Math.abs(s.vx) + Math.abs(s.vz) > 0.35
+                  ? 'walk'
+                  : 'idle';
+            const desiredClip = pickModel3DAnimationClip(
+              s.entity.animation,
+              s.availableClips,
+              animState
+            );
+            if (desiredClip && desiredClip !== s.activeClip) {
+              const prevAction = s.activeClip ? s.actions.get(s.activeClip) : undefined;
+              const nextAction = s.actions.get(desiredClip);
+              if (nextAction) {
+                prevAction?.fadeOut(0.18);
+                nextAction.reset().fadeIn(0.18).play();
+                s.activeClip = desiredClip;
+              }
+            }
+            s.mixer.update(dt * (s.entity.animation?.speed || 1));
+          }
+
+          if (s.entity.animation?.preset === 'float' || s.entity.behavior?.mode === 'collectible-bob') {
             s.object3D.position.y =
-              s.baseY + Math.sin(s.animTime * (s.entity.animation.speed || 2.5)) * ((s.entity.animation.amplitude || 4) * 0.08);
+              s.baseY + Math.sin(s.animTime * (s.entity.animation?.speed || 2.5)) * ((s.entity.animation?.amplitude || 4) * 0.08);
           } else if (s.entity.animation?.preset === 'spin') {
             s.object3D.rotation.y += dt * (s.entity.animation.speed || 2);
           } else if (s.entity.animation?.preset === 'pulse') {
@@ -1201,9 +1409,50 @@ export const Engine3D: React.FC<Engine3DProps> = ({
           if (s.entity.physics.useGravity) {
             s.vy -= grav * dt;
           }
-          s.object3D.position.x = THREE.MathUtils.clamp(s.object3D.position.x + s.vx * dt, -26, 26);
-          s.object3D.position.z = THREE.MathUtils.clamp(s.object3D.position.z + s.vz * dt, -26, 26);
+
+          const prevY = s.object3D.position.y;
+          const halfW = Math.max(0.3, s.entity.width * 0.45);
+          const halfD = Math.max(0.3, s.entity.depth * 0.45);
+          const entH = Math.max(0.5, s.entity.height);
+
+          s.object3D.position.x = THREE.MathUtils.clamp(s.object3D.position.x + s.vx * dt, -28, 28);
+          s.object3D.position.z = THREE.MathUtils.clamp(s.object3D.position.z + s.vz * dt, -28, 28);
           s.object3D.position.y += s.vy * dt;
+          s.onGround = false;
+
+          // Resolve 3D Box3 solid collisions & platforms
+          for (const { sim: sol, box } of solidBoxes) {
+            if (sol.entity.id === s.entity.id) continue;
+            const px = s.object3D.position.x;
+            const py = s.object3D.position.y;
+            const pz = s.object3D.position.z;
+            const overlapsXZ =
+              px + halfW > box.min.x &&
+              px - halfW < box.max.x &&
+              pz + halfD > box.min.z &&
+              pz - halfD < box.max.z;
+            const overlapsY = py < box.max.y && py + entH > box.min.y;
+            if (!overlapsXZ || !overlapsY) continue;
+
+            if (prevY >= box.max.y - 0.35 && s.vy <= 0) {
+              s.object3D.position.y = box.max.y;
+              s.vy = 0;
+              s.onGround = true;
+              if (sol.lastStepDx !== 0) {
+                s.object3D.position.x += sol.lastStepDx;
+              }
+            } else {
+              const pushLeft = Math.abs(px + halfW - box.min.x);
+              const pushRight = Math.abs(box.max.x - (px - halfW));
+              const pushFront = Math.abs(pz + halfD - box.min.z);
+              const pushBack = Math.abs(box.max.z - (pz - halfD));
+              const m = Math.min(pushLeft, pushRight, pushFront, pushBack);
+              if (m === pushLeft) s.object3D.position.x = box.min.x - halfW;
+              else if (m === pushRight) s.object3D.position.x = box.max.x + halfW;
+              else if (m === pushFront) s.object3D.position.z = box.min.z - halfD;
+              else s.object3D.position.z = box.max.z + halfD;
+            }
+          }
 
           if (s.object3D.position.y <= 0) {
             s.object3D.position.y = 0;
@@ -1264,6 +1513,102 @@ export const Engine3D: React.FC<Engine3DProps> = ({
             scene.remove(pt.mesh);
             mat.dispose();
             particles3DRef.current.splice(i, 1);
+          }
+        }
+
+        // 3D General CollisionConfig + Behavior Triggers
+        for (const trig of sims) {
+          if (!trig.alive) continue;
+          const behMode = trig.entity.behavior?.mode;
+          const colCfg = trig.entity.collisionConfig;
+          const effectiveAction =
+            colCfg?.onCollideAction && colCfg.onCollideAction !== 'none'
+              ? colCfg.onCollideAction
+              : behMode === 'collectible-bob'
+                ? 'collect'
+                : behMode === 'hazard-damage'
+                  ? 'damage'
+                  : behMode === 'bounce-pad'
+                    ? 'bounce'
+                    : behMode === 'scene-portal'
+                      ? 'go-to-scene'
+                      : 'none';
+          if (effectiveAction === 'none' && behMode !== 'checkpoint') continue;
+
+          const filterRole = colCfg?.filterRole || 'player';
+          const hitRadius = Math.max(1.2, (trig.entity.width + trig.entity.depth) * 0.45);
+          for (const other of sims) {
+            if (!other.alive || other.entity.id === trig.entity.id) continue;
+            if (filterRole !== 'any' && other.entity.role !== filterRole) continue;
+            if (trig.object3D.position.distanceTo(other.object3D.position) > hitRadius) continue;
+
+            if (behMode === 'checkpoint') {
+              const cpKey = `cp3d_${trig.entity.id}_${other.entity.id}`;
+              if (!triggeredOnce.has(cpKey)) {
+                triggeredOnce.add(cpKey);
+                other.startX = trig.object3D.position.x;
+                other.baseY = trig.object3D.position.y + 0.5;
+                other.startZ = trig.object3D.position.z;
+                spawn3DParticles(scene, trig.object3D.position, 'sparkle', 14);
+                audioEngine.playSound('coin', projectRef.current.assets);
+                setBannerMessage(trig.entity.behavior?.message || `نقطه ذخیره «${trig.entity.name}» فعال شد`);
+              }
+              continue;
+            }
+
+            const key = `gcol3d_${trig.entity.id}_${other.entity.id}`;
+            if (nowMs - (collisionCooldown.get(key) ?? 0) < 650) continue;
+            collisionCooldown.set(key, nowMs);
+
+            const amount = colCfg?.actionAmount ?? trig.entity.behavior?.amount ?? 15;
+            if (effectiveAction === 'collect') {
+              trig.alive = false;
+              trig.object3D.visible = false;
+              varsRef.current.score += amount;
+              spawn3DParticles(scene, trig.object3D.position, 'sparkle', 14);
+              audioEngine.playSound(colCfg?.sound || projectRef.current.soundBindings.onCollect || 'coin', projectRef.current.assets);
+            } else if (effectiveAction === 'damage') {
+              varsRef.current.health = Math.max(0, varsRef.current.health - amount);
+              shakeRef.current = 0.3;
+              spawn3DParticles(scene, other.object3D.position, 'explosion', 14);
+              audioEngine.playSound(colCfg?.sound || projectRef.current.soundBindings.onHit || 'hit', projectRef.current.assets);
+              other.vy = 5;
+            } else if (effectiveAction === 'bounce') {
+              other.vy = Math.max(8, amount > 30 ? 14 : amount);
+              other.onGround = false;
+              spawn3DParticles(scene, other.object3D.position, 'sparkle', 10);
+              audioEngine.playSound(colCfg?.sound || 'jump', projectRef.current.assets);
+            } else if (effectiveAction === 'destroy-other') {
+              other.alive = false;
+              other.object3D.visible = false;
+              spawn3DParticles(scene, other.object3D.position, 'explosion', 14);
+            } else if (effectiveAction === 'destroy-self') {
+              trig.alive = false;
+              trig.object3D.visible = false;
+              spawn3DParticles(scene, trig.object3D.position, 'explosion', 14);
+            } else if (effectiveAction === 'next-scene') {
+              const idx = projectRef.current.scenes.findIndex((sc) => sc.id === curScene.id);
+              const nextSc = projectRef.current.scenes[idx + 1];
+              if (nextSc) {
+                triggeredOnce.clear();
+                timerAcc.clear();
+                void syncSceneEntities(scene, nextSc, projectRef.current);
+              } else {
+                setBannerMessage('تبریک! تمام مراحل سه‌بعدی تکمیل شد!');
+              }
+              break;
+            } else if (effectiveAction === 'go-to-scene') {
+              const targetScId = colCfg?.targetSceneId || trig.entity.behavior?.nextSceneId;
+              const nextSc =
+                projectRef.current.scenes.find((sc) => sc.id === targetScId || sc.name === targetScId) ||
+                projectRef.current.scenes[projectRef.current.scenes.findIndex((sc) => sc.id === curScene.id) + 1];
+              if (nextSc && nextSc.id !== curScene.id) {
+                triggeredOnce.clear();
+                timerAcc.clear();
+                void syncSceneEntities(scene, nextSc, projectRef.current);
+              }
+              break;
+            }
           }
         }
 

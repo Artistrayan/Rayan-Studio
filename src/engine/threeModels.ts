@@ -24,7 +24,11 @@ import type {
   RayanAsset,
   Model3DMetadata,
 } from '../types/studio';
-import { getAssetFromDb } from '../storage/projectDb';
+import {
+  getAssetFromDb,
+  retrieveBinaryModel,
+  type StoredAssetDependency,
+} from '../storage/projectDb';
 
 export function dataUrlToArrayBuffer(dataUrl: string): ArrayBuffer {
   const base64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
@@ -649,144 +653,202 @@ export function extractModelStatsFromObject3D(
   };
 }
 
+function createDependencyLoadingManager(dependencies: StoredAssetDependency[] = []): {
+  manager: THREE.LoadingManager;
+  cleanup: () => void;
+} {
+  const manager = new THREE.LoadingManager();
+  const createdUrls: string[] = [];
+
+  if (dependencies.length > 0 && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
+    const mapByKey = new Map<string, string>();
+    dependencies.forEach((dep) => {
+      const blobUrl = URL.createObjectURL(new Blob([dep.buffer], { type: dep.mimeType }));
+      createdUrls.push(blobUrl);
+      const norm = dep.relativePath.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+      const baseName = norm.split('/').pop() || norm;
+      mapByKey.set(norm, blobUrl);
+      if (!mapByKey.has(baseName)) {
+        mapByKey.set(baseName, blobUrl);
+      }
+    });
+
+    manager.setURLModifier((url) => {
+      const clean = url.split('?')[0].split('#')[0].replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+      const base = clean.split('/').pop() || clean;
+      return mapByKey.get(clean) || mapByKey.get(base) || url;
+    });
+  }
+
+  return {
+    manager,
+    cleanup: () => {
+      if (createdUrls.length > 0 && typeof URL !== 'undefined' && typeof URL.revokeObjectURL === 'function') {
+        setTimeout(() => {
+          createdUrls.forEach((u) => URL.revokeObjectURL(u));
+        }, 1500);
+      }
+    },
+  };
+}
+
 /**
- * Parses an ArrayBuffer into a normalized Three.js Group using the appropriate real Three.js Loader.
+ * Parses an ArrayBuffer into a normalized Three.js Group using the appropriate real Three.js Loader,
+ * resolving any companion textures, MTL material files, or .bin buffers from IndexedDB.
  */
 export async function parse3DModelBuffer(
   buffer: ArrayBuffer,
   formatRaw: string,
-  fallbackColor = '#38bdf8'
+  fallbackColor = '#38bdf8',
+  dependencies: StoredAssetDependency[] = []
 ): Promise<THREE.Group> {
   const format = formatRaw.toLowerCase();
   if (!buffer || buffer.byteLength === 0) {
     throw new Error('فایل مدل سه‌بعدی خالی است.');
   }
 
-  // 1. GLB / glTF
-  if (format === 'glb' || format === 'gltf') {
-    const loader = new GLTFLoader();
-    loader.setDRACOLoader(getDracoLoader());
+  const { manager, cleanup } = createDependencyLoadingManager(dependencies);
 
-    const bytes = new Uint8Array(buffer);
-    const isGlb =
-      bytes.length >= 4 &&
-      bytes[0] === 0x67 &&
-      bytes[1] === 0x6c &&
-      bytes[2] === 0x54 &&
-      bytes[3] === 0x46;
+  try {
+    // 1. GLB / glTF
+    if (format === 'glb' || format === 'gltf') {
+      const loader = new GLTFLoader(manager);
+      loader.setDRACOLoader(getDracoLoader());
 
-    const parseInput: ArrayBuffer | string = isGlb
-      ? buffer
-      : new TextDecoder().decode(bytes);
+      const bytes = new Uint8Array(buffer);
+      const isGlb =
+        bytes.length >= 4 &&
+        bytes[0] === 0x67 &&
+        bytes[1] === 0x6c &&
+        bytes[2] === 0x54 &&
+        bytes[3] === 0x46;
 
-    return new Promise((resolve, reject) => {
-      loader.parse(
-        parseInput,
-        '',
-        (gltf) => {
-          const group = normalizeLoadedObject(gltf.scene, {
-            animations: gltf.animations,
-            format: format.toUpperCase(),
-          });
-          resolve(group);
-        },
-        (err) => reject(err instanceof Error ? err : new Error(String(err)))
+      const parseInput: ArrayBuffer | string = isGlb
+        ? buffer
+        : new TextDecoder().decode(bytes);
+
+      return await new Promise<THREE.Group>((resolve, reject) => {
+        loader.parse(
+          parseInput,
+          '',
+          (gltf) => {
+            const group = normalizeLoadedObject(gltf.scene, {
+              animations: gltf.animations,
+              format: format.toUpperCase(),
+            });
+            resolve(group);
+          },
+          (err) => reject(err instanceof Error ? err : new Error(String(err)))
+        );
+      });
+    }
+
+    // 2. FBX (Skeletal animation, rigs, meshes)
+    if (format === 'fbx') {
+      const loader = new FBXLoader(manager);
+      const fbxObj = loader.parse(buffer, '');
+      return normalizeLoadedObject(fbxObj, {
+        animations: fbxObj.animations || [],
+        format: 'FBX',
+      });
+    }
+
+    // 3. OBJ (Geometry + optional companion MTL + textures)
+    if (format === 'obj') {
+      const loader = new OBJLoader(manager);
+      const mtlDep = dependencies.find(
+        (d) => d.kind === 'material' || d.relativePath.toLowerCase().endsWith('.mtl')
       );
-    });
-  }
-
-  // 2. FBX (Skeletal animation, rigs, meshes)
-  if (format === 'fbx') {
-    const loader = new FBXLoader();
-    const fbxObj = loader.parse(buffer, '');
-    return normalizeLoadedObject(fbxObj, {
-      animations: fbxObj.animations || [],
-      format: 'FBX',
-    });
-  }
-
-  // 3. OBJ (Geometry + Materials)
-  if (format === 'obj') {
-    const loader = new OBJLoader();
-    const text = new TextDecoder().decode(new Uint8Array(buffer));
-    const obj = loader.parse(text);
-
-    let meshCount = 0;
-    obj.traverse((child) => {
-      if ((child as THREE.Mesh).isMesh) {
-        meshCount += 1;
-        const mesh = child as THREE.Mesh;
-        if (mesh.geometry && !mesh.geometry.getAttribute('normal')) {
-          mesh.geometry.computeVertexNormals();
-        }
-        if (!mesh.material || (Array.isArray(mesh.material) && mesh.material.length === 0)) {
-          mesh.material = new THREE.MeshStandardMaterial({
-            color: fallbackColor,
-            roughness: 0.5,
-            metalness: 0.2,
-          });
-        }
+      if (mtlDep) {
+        const mtlLoader = new MTLLoader(manager);
+        const mtlText = new TextDecoder().decode(new Uint8Array(mtlDep.buffer));
+        const materials = mtlLoader.parse(mtlText, '');
+        materials.preload();
+        loader.setMaterials(materials);
       }
-    });
-    if (meshCount === 0) {
-      throw new Error('فایل OBJ فاقد هندسه یا مش قابل نمایش است.');
+
+      const text = new TextDecoder().decode(new Uint8Array(buffer));
+      const obj = loader.parse(text);
+
+      let meshCount = 0;
+      obj.traverse((child) => {
+        if ((child as THREE.Mesh).isMesh) {
+          meshCount += 1;
+          const mesh = child as THREE.Mesh;
+          if (mesh.geometry && !mesh.geometry.getAttribute('normal')) {
+            mesh.geometry.computeVertexNormals();
+          }
+          if (!mesh.material || (Array.isArray(mesh.material) && mesh.material.length === 0)) {
+            mesh.material = new THREE.MeshStandardMaterial({
+              color: fallbackColor,
+              roughness: 0.5,
+              metalness: 0.2,
+            });
+          }
+        }
+      });
+      if (meshCount === 0) {
+        throw new Error('فایل OBJ فاقد هندسه یا مش قابل نمایش است.');
+      }
+      return normalizeLoadedObject(obj, { format: 'OBJ' });
     }
-    return normalizeLoadedObject(obj, { format: 'OBJ' });
-  }
 
-  // 4. STL (Geometric models)
-  if (format === 'stl') {
-    const loader = new STLLoader();
-    const geometry = loader.parse(buffer);
-    const pos = geometry.getAttribute('position');
-    if (!pos || pos.count === 0) {
-      throw new Error('فایل STL فاقد مثلث یا رأس معتبر است.');
+    // 4. STL (Geometric models)
+    if (format === 'stl') {
+      const loader = new STLLoader(manager);
+      const geometry = loader.parse(buffer);
+      const pos = geometry.getAttribute('position');
+      if (!pos || pos.count === 0) {
+        throw new Error('فایل STL فاقد مثلث یا رأس معتبر است.');
+      }
+      geometry.computeVertexNormals();
+
+      const mesh = new THREE.Mesh(
+        geometry,
+        new THREE.MeshStandardMaterial({
+          color: fallbackColor,
+          roughness: 0.45,
+          metalness: 0.35,
+        })
+      );
+      return normalizeLoadedObject(mesh, { format: 'STL' });
     }
-    geometry.computeVertexNormals();
 
-    const mesh = new THREE.Mesh(
-      geometry,
-      new THREE.MeshStandardMaterial({
-        color: fallbackColor,
-        roughness: 0.45,
-        metalness: 0.35,
-      })
-    );
-    return normalizeLoadedObject(mesh, { format: 'STL' });
-  }
-
-  // 5. USD / USDZ (Universal Scene Description - Complex assets)
-  if (format === 'usd' || format === 'usdz') {
-    const loader = new USDLoader();
-    const usdGroup = loader.parse(buffer);
-    return normalizeLoadedObject(usdGroup, {
-      format: format.toUpperCase(),
-    });
-  }
-
-  // 6. PLY
-  if (format === 'ply') {
-    const loader = new PLYLoader();
-    const geometry = loader.parse(buffer);
-    const pos = geometry.getAttribute('position');
-    if (!pos || pos.count === 0) {
-      throw new Error('فایل PLY فاقد داده‌های هندسی معتبر است.');
+    // 5. USD / USDZ (Universal Scene Description - Complex assets)
+    if (format === 'usd' || format === 'usdz') {
+      const loader = new USDLoader(manager);
+      const usdGroup = loader.parse(buffer);
+      return normalizeLoadedObject(usdGroup, {
+        format: format.toUpperCase(),
+      });
     }
-    geometry.computeVertexNormals();
-    const hasColors = Boolean(geometry.getAttribute('color'));
-    const mesh = new THREE.Mesh(
-      geometry,
-      new THREE.MeshStandardMaterial({
-        color: hasColors ? 0xffffff : fallbackColor,
-        vertexColors: hasColors,
-        roughness: 0.5,
-        metalness: 0.2,
-      })
-    );
-    return normalizeLoadedObject(mesh, { format: 'PLY' });
-  }
 
-  throw new Error(`فرمت مدل «${format}» پشتیبانی نمی‌شود.`);
+    // 6. PLY
+    if (format === 'ply') {
+      const loader = new PLYLoader(manager);
+      const geometry = loader.parse(buffer);
+      const pos = geometry.getAttribute('position');
+      if (!pos || pos.count === 0) {
+        throw new Error('فایل PLY فاقد داده‌های هندسی معتبر است.');
+      }
+      geometry.computeVertexNormals();
+      const hasColors = Boolean(geometry.getAttribute('color'));
+      const mesh = new THREE.Mesh(
+        geometry,
+        new THREE.MeshStandardMaterial({
+          color: hasColors ? 0xffffff : fallbackColor,
+          vertexColors: hasColors,
+          roughness: 0.5,
+          metalness: 0.2,
+        })
+      );
+      return normalizeLoadedObject(mesh, { format: 'PLY' });
+    }
+
+    throw new Error(`فرمت مدل «${format}» پشتیبانی نمی‌شود.`);
+  } finally {
+    cleanup();
+  }
 }
 
 /**
@@ -796,9 +858,10 @@ export async function parse3DModelBuffer(
 export async function parseAndInspect3DModelFile(
   buffer: ArrayBuffer,
   format: AssetFormat,
-  fallbackColor = '#38bdf8'
+  fallbackColor = '#38bdf8',
+  dependencies: StoredAssetDependency[] = []
 ): Promise<{ object: THREE.Group; meta: Model3DMetadata }> {
-  const object = await parse3DModelBuffer(buffer, format, fallbackColor);
+  const object = await parse3DModelBuffer(buffer, format, fallbackColor, dependencies);
   const baseStats = extractModelStatsFromObject3D(object, format);
 
   if (format === 'glb' || format === 'gltf') {
@@ -821,21 +884,34 @@ export async function parseAndInspect3DModelFile(
 }
 
 /**
- * Loads custom 3D asset from either its in-memory DataURL or IndexedDB binary record.
+ * Loads custom 3D asset using the dedicated IndexedDB binary model retriever
+ * (reassembling chunked models and companion texture/MTL/bin dependencies),
+ * or falling back to inline DataURL when present.
  */
 export async function loadCustom3DAsset(
   asset: RayanAsset,
   fallbackColor: string
 ): Promise<THREE.Group> {
   let buffer: ArrayBuffer | null = null;
+  let dependencies: StoredAssetDependency[] = [];
 
-  if (asset.dataUrl && !asset.dataUrl.startsWith('idb://')) {
+  try {
+    const retrieved = await retrieveBinaryModel(asset.id);
+    if (retrieved) {
+      buffer = retrieved.buffer;
+      dependencies = retrieved.dependencies;
+    }
+  } catch {
+    // Fall through to inline / legacy lookup
+  }
+
+  if (!buffer && asset.dataUrl && !asset.dataUrl.startsWith('idb://')) {
     buffer = dataUrlToArrayBuffer(asset.dataUrl);
-  } else {
+  } else if (!buffer) {
     const record = await getAssetFromDb(asset.id);
     if (record?.buffer) {
       buffer = record.buffer;
-    } else if (record?.dataUrl) {
+    } else if (record?.dataUrl && !record.dataUrl.startsWith('idb://')) {
       buffer = dataUrlToArrayBuffer(record.dataUrl);
     }
   }
@@ -844,6 +920,6 @@ export async function loadCustom3DAsset(
     throw new Error(`داده‌های باینری مدل «${asset.name}» در حافظه یا IndexedDB یافت نشد.`);
   }
 
-  return parse3DModelBuffer(buffer, asset.format, fallbackColor);
+  return parse3DModelBuffer(buffer, asset.format, fallbackColor, dependencies);
 }
 

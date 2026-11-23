@@ -11,10 +11,15 @@ import type {
 import { audioEngine } from './audioEngine';
 import { BoxLayersRenderer } from '../components/BoxLayersRenderer';
 import {
-  compileRuntimeScripts,
-  type CompiledScriptHandle,
-  type ScriptRuntimeApi,
+  createGameScriptSession,
+  type GameScriptWorkerSession,
 } from './customScriptRunner';
+import type { HookCommandBatch } from '../runtime/workers/javascriptWorker';
+import { retrieveBinaryModel } from '../storage/projectDb';
+import {
+  getDefaultCollisionConfig,
+  getSpritesheetFrameCoords,
+} from './gameRuntimeHelpers';
 
 export interface RuntimeStatsPayload {
   score: number;
@@ -54,6 +59,8 @@ interface SimBody {
   startY: number;
   vx: number;
   vy: number;
+  lastStepDx: number;
+  lastStepDy: number;
   width: number;
   height: number;
   rotationZ: number;
@@ -72,6 +79,8 @@ interface SimBody {
   physics: GameEntity['physics'];
   textConfig?: GameEntity['textConfig'];
   animation?: GameEntity['animation'];
+  behavior?: GameEntity['behavior'];
+  collisionConfig?: GameEntity['collisionConfig'];
 }
 
 interface Projectile2D {
@@ -241,8 +250,10 @@ export const Engine2D: React.FC<Engine2DProps> = ({
   const [clickedBoxId, setClickedBoxId] = useState<string | null>(null);
   const lastScrollRuleRef = useRef<Map<string, number>>(new Map());
   const suppressNextClickRef = useRef(false);
-  const compiledScriptsRef = useRef<CompiledScriptHandle[]>([]);
+  const scriptSessionRef = useRef<GameScriptWorkerSession | null>(null);
   const scriptsStartedRef = useRef(false);
+  const scriptStepAccRef = useRef(0);
+  const idbObjectUrlsRef = useRef<Map<string, string>>(new Map());
   const [debugBadge, setDebugBadge] = useState<{
     fps: number;
     entities: number;
@@ -314,6 +325,8 @@ export const Engine2D: React.FC<Engine2DProps> = ({
       startY: e.y,
       vx: 0,
       vy: 0,
+      lastStepDx: 0,
+      lastStepDy: 0,
       width: e.width,
       height: e.height,
       rotationZ: e.rotationZ,
@@ -332,6 +345,10 @@ export const Engine2D: React.FC<Engine2DProps> = ({
       physics: { ...e.physics },
       textConfig: e.textConfig ? { ...e.textConfig } : undefined,
       animation: e.animation ? { ...e.animation } : undefined,
+      behavior: e.behavior ? { ...e.behavior } : undefined,
+      collisionConfig: e.collisionConfig
+        ? { ...e.collisionConfig }
+        : getDefaultCollisionConfig(e.role),
     }));
     projectilesRef.current = [];
     particlesRef.current = [];
@@ -362,8 +379,9 @@ export const Engine2D: React.FC<Engine2DProps> = ({
     );
   };
 
-  // Preload images across all scenes & assets
+  // Preload images across all scenes & assets (including idb:// IndexedDB binaries)
   useEffect(() => {
+    let cancelled = false;
     const cache = imageCacheRef.current;
     const urls: string[] = [];
     project.scenes.forEach((sc) => {
@@ -374,11 +392,28 @@ export const Engine2D: React.FC<Engine2DProps> = ({
     if (project.environment.backgroundType === 'image' && project.environment.backgroundImageUrl) {
       urls.push(project.environment.backgroundImageUrl);
     }
-    project.assets.forEach((a) => {
-      if (a.kind === 'image' && a.dataUrl) {
+
+    for (const a of project.assets) {
+      if (a.kind !== 'image') continue;
+      if (a.dataUrl && !a.dataUrl.startsWith('idb://')) {
         urls.push(a.dataUrl);
+      } else if (!idbObjectUrlsRef.current.has(a.id)) {
+        void retrieveBinaryModel(a.id).then((model) => {
+          if (cancelled || !model || !model.buffer) return;
+          const mime =
+            a.format === 'svg'
+              ? 'image/svg+xml'
+              : `image/${a.format === 'jpg' ? 'jpeg' : a.format}`;
+          const objUrl = URL.createObjectURL(new Blob([model.buffer], { type: mime }));
+          idbObjectUrlsRef.current.set(a.id, objUrl);
+          const img = new Image();
+          img.src = objUrl;
+          cache.set(`idb://${a.id}`, img);
+          cache.set(objUrl, img);
+        });
       }
-    });
+    }
+
     urls.forEach((url) => {
       if (!cache.has(url)) {
         const img = new Image();
@@ -386,27 +421,43 @@ export const Engine2D: React.FC<Engine2DProps> = ({
         cache.set(url, img);
       }
     });
+
+    return () => {
+      cancelled = true;
+    };
   }, [project.assets, project.environment.backgroundImageUrl, project.environment.backgroundType, project.scenes]);
+
+  useEffect(() => {
+    const objectUrlMap = idbObjectUrlsRef.current;
+    return () => {
+      objectUrlMap.forEach((u) => URL.revokeObjectURL(u));
+      objectUrlMap.clear();
+    };
+  }, []);
 
   // Initialize simulation when entering/leaving Play Mode or updating scene in Editor
   useEffect(() => {
     const scene = activeSceneFromProject();
     loadSceneIntoSimulation(scene, true);
 
+    scriptSessionRef.current?.dispose();
+    scriptSessionRef.current = null;
+    scriptsStartedRef.current = false;
+    scriptStepAccRef.current = 0;
+
     if (isPlaying) {
       audioEngine.startBgm(project.soundBindings.bgm, project.assets);
-      compiledScriptsRef.current = compileRuntimeScripts(project.codeFiles, (fname, errMsg) => {
+      scriptSessionRef.current = createGameScriptSession(project.codeFiles, (fname, errMsg) => {
         logsRef.current = [`خطای کد ${fname}: ${errMsg}`, ...logsRef.current.slice(0, 14)];
       });
-      scriptsStartedRef.current = false;
     } else {
       audioEngine.stopBgm();
-      compiledScriptsRef.current = [];
-      scriptsStartedRef.current = false;
     }
 
     return () => {
       audioEngine.stopBgm();
+      scriptSessionRef.current?.dispose();
+      scriptSessionRef.current = null;
     };
   }, [
     isPlaying,
@@ -597,6 +648,8 @@ export const Engine2D: React.FC<Engine2DProps> = ({
             startY: spawnY,
             vx: 0,
             vy: 0,
+            lastStepDx: 0,
+            lastStepDy: 0,
             width: template.width,
             height: template.height,
             rotationZ: template.rotationZ,
@@ -613,6 +666,10 @@ export const Engine2D: React.FC<Engine2DProps> = ({
             physics: { ...template.physics },
             textConfig: template.textConfig ? { ...template.textConfig } : undefined,
             animation: template.animation ? { ...template.animation } : undefined,
+            behavior: template.behavior ? { ...template.behavior } : undefined,
+            collisionConfig: template.collisionConfig
+              ? { ...template.collisionConfig }
+              : getDefaultCollisionConfig(template.role),
           });
           spawnParticleBurst(spawnX + template.width / 2, spawnY + template.height / 2, 'sparkle', 10);
           pushLog(`تولید ${template.name}`);
@@ -771,78 +828,70 @@ export const Engine2D: React.FC<Engine2DProps> = ({
       if (isPlaying) {
         elapsedRef.current += dt;
 
-        // 0. Custom IDE JS script hooks (onStart / onUpdate)
-        if (compiledScriptsRef.current.length > 0) {
-          const scriptApi: ScriptRuntimeApi = {
-            get score() {
-              return varsRef.current.score;
-            },
-            setScore: (val) => {
-              varsRef.current.score = val;
-            },
-            addScore: (delta) => {
-              varsRef.current.score += delta;
-            },
-            get health() {
-              return varsRef.current.health;
-            },
-            setHealth: (val) => {
-              varsRef.current.health = Math.max(0, val);
-            },
-            get vars() {
-              return varsRef.current.custom;
-            },
-            setVar: (name, val) => {
-              varsRef.current.custom[name] = val;
-            },
-            get elapsed() {
-              return elapsedRef.current;
-            },
-            findEntity: (name) => {
-              const found = bodies.find((b) => b.alive && b.name === name);
-              return found || null;
-            },
-            moveEntity: (name, vx, vy) => {
-              const found = bodies.find((b) => b.alive && b.name === name);
+        // 0. Custom IDE JS script hooks executed inside isolated Web Worker
+        const session = scriptSessionRef.current;
+        if (session?.active) {
+          const applyHookBatch = (batch: HookCommandBatch) => {
+            if (batch.setScore !== undefined) varsRef.current.score = batch.setScore;
+            if (batch.scoreDelta) varsRef.current.score += batch.scoreDelta;
+            if (batch.setHealth !== undefined) varsRef.current.health = Math.max(0, batch.setHealth);
+            for (const [k, v] of Object.entries(batch.varPatches || {})) {
+              varsRef.current.custom[k] = Number(v);
+            }
+            for (const mv of batch.moves || []) {
+              const found = bodies.find((b) => b.alive && b.name === mv.name);
               if (found) {
-                found.vx = vx;
-                found.vy = vy;
+                found.vx = mv.vx;
+                found.vy = mv.vy;
               }
-            },
-            setEntityPosition: (name, x, y) => {
-              const found = bodies.find((b) => b.alive && b.name === name);
+            }
+            for (const pos of batch.positions || []) {
+              const found = bodies.find((b) => b.alive && b.name === pos.name);
               if (found) {
-                found.x = x;
-                found.y = y;
+                found.x = pos.x;
+                found.y = pos.y;
               }
-            },
-            showMessage: (msg) => setBannerMessage(String(msg)),
-            playSound: (name) => audioEngine.playSound(name, project.assets),
-            spawnParticles: (x, y, preset = 'sparkle') =>
-              spawnParticleBurst(x, y, preset as ParticlePreset, 18),
-            log: (msg) => {
-              logsRef.current = [String(msg), ...logsRef.current.slice(0, 14)];
-            },
+            }
+            for (const pt of batch.particles || []) {
+              spawnParticleBurst(pt.x, pt.y, (pt.preset || 'sparkle') as ParticlePreset, 18);
+            }
+            for (const snd of batch.sounds || []) {
+              audioEngine.playSound(snd, project.assets);
+            }
+            if (batch.messages?.length) {
+              setBannerMessage(batch.messages[batch.messages.length - 1]);
+            }
+            if (batch.logs?.length) {
+              logsRef.current = [...batch.logs.slice().reverse(), ...logsRef.current].slice(0, 14);
+            }
+          };
+
+          const snapshot = {
+            score: varsRef.current.score,
+            health: varsRef.current.health,
+            vars: { ...varsRef.current.custom },
+            elapsed: elapsedRef.current,
+            entities: bodies
+              .filter((b) => b.alive)
+              .map((b) => ({
+                name: b.name,
+                x: b.x,
+                y: b.y,
+                vx: b.vx,
+                vy: b.vy,
+                visible: b.visible,
+              })),
           };
 
           if (!scriptsStartedRef.current) {
             scriptsStartedRef.current = true;
-            for (const h of compiledScriptsRef.current) {
-              try {
-                h.onStart?.(scriptApi);
-              } catch (err) {
-                logsRef.current = [
-                  `خطا در ${h.fileName}: ${err instanceof Error ? err.message : String(err)}`,
-                  ...logsRef.current.slice(0, 14),
-                ];
-              }
-            }
-          }
-          for (const h of compiledScriptsRef.current) {
-            try {
-              h.onUpdate?.(scriptApi, dt);
-            } catch {
-              // ignore per-frame uncaught runtime errors after compile check
+            session.runStart(snapshot, applyHookBatch);
+          } else {
+            scriptStepAccRef.current += dt;
+            if (scriptStepAccRef.current >= 0.032) {
+              const stepDt = scriptStepAccRef.current;
+              scriptStepAccRef.current = 0;
+              session.stepUpdate(stepDt, snapshot, applyHookBatch);
             }
           }
         }
@@ -908,10 +957,123 @@ export const Engine2D: React.FC<Engine2DProps> = ({
         });
         keysJustPressedRef.current = {};
 
+        // 3.5 Per-entity declarative Behaviors
+        bodies.forEach((b) => {
+          b.lastStepDx = 0;
+          b.lastStepDy = 0;
+          if (!b.alive || !b.behavior || b.behavior.mode === 'none') return;
+          const beh = b.behavior;
+          const targetObj =
+            (beh.targetName
+              ? bodies.find((t) => t.alive && t.name === beh.targetName)
+              : undefined) || bodies.find((t) => t.alive && t.role === 'player');
+
+          switch (beh.mode) {
+            case 'patrol': {
+              const sp = beh.speed ?? 110;
+              const range = beh.range ?? 160;
+              b.vx = sp * b.patrolDir;
+              b.facing = b.patrolDir;
+              if (b.x <= Math.max(8, b.startX - range)) b.patrolDir = 1;
+              if (b.x >= Math.min(worldW - b.width - 8, b.startX + range)) b.patrolDir = -1;
+              break;
+            }
+            case 'moving-platform': {
+              const sp = beh.speed ?? 90;
+              const range = beh.range ?? 150;
+              const prevX = b.x;
+              b.x += sp * b.patrolDir * dt;
+              if (b.x <= Math.max(0, b.startX - range)) {
+                b.x = Math.max(0, b.startX - range);
+                b.patrolDir = 1;
+              } else if (b.x >= Math.min(worldW - b.width, b.startX + range)) {
+                b.x = Math.min(worldW - b.width, b.startX + range);
+                b.patrolDir = -1;
+              }
+              b.lastStepDx = b.x - prevX;
+              break;
+            }
+            case 'chase': {
+              if (!targetObj || targetObj.id === b.id) break;
+              const range = beh.range ?? 540;
+              const dx = targetObj.x - b.x;
+              const dy = targetObj.y - b.y;
+              const dist = Math.hypot(dx, dy);
+              if (dist > 4 && dist <= range) {
+                const sp = beh.speed ?? 100;
+                b.vx = (dx / dist) * sp;
+                b.facing = dx >= 0 ? 1 : -1;
+                if (!b.physics.useGravity) {
+                  b.vy = (dy / dist) * sp;
+                }
+              }
+              break;
+            }
+            case 'flee': {
+              if (!targetObj || targetObj.id === b.id) break;
+              const range = beh.range ?? 280;
+              const dx = b.x - targetObj.x;
+              const dy = b.y - targetObj.y;
+              const dist = Math.hypot(dx, dy) || 1;
+              if (dist <= range) {
+                const sp = beh.speed ?? 120;
+                b.vx = (dx / dist) * sp;
+                b.facing = dx >= 0 ? 1 : -1;
+                if (!b.physics.useGravity) {
+                  b.vy = (dy / dist) * sp;
+                }
+              }
+              break;
+            }
+            case 'orbit': {
+              if (!targetObj || targetObj.id === b.id) break;
+              b.orbitAngle += (beh.speed ?? 2) * dt;
+              const r = beh.range ?? 110;
+              b.x = targetObj.x + targetObj.width / 2 - b.width / 2 + Math.cos(b.orbitAngle) * r;
+              b.y = targetObj.y + targetObj.height / 2 - b.height / 2 + Math.sin(b.orbitAngle) * r;
+              break;
+            }
+            case 'turret-shoot': {
+              if (!targetObj) break;
+              const key = `beh_shoot_${b.id}`;
+              const acc = (timerAccRef.current.get(key) || 0) + dt;
+              const interval = beh.intervalSeconds || 2;
+              if (acc >= interval) {
+                timerAccRef.current.set(key, acc - interval);
+                const dx = targetObj.x + targetObj.width / 2 - (b.x + b.width / 2);
+                const dy = targetObj.y + targetObj.height / 2 - (b.y + b.height / 2);
+                const dist = Math.hypot(dx, dy) || 1;
+                const sp = beh.speed ?? 360;
+                projectilesRef.current.push({
+                  x: b.x + b.width / 2,
+                  y: b.y + b.height / 2,
+                  vx: (dx / dist) * sp,
+                  vy: (dy / dist) * sp,
+                  radius: 7,
+                  color: '#F97316',
+                  life: 3.5,
+                });
+                audioEngine.playSound(project.soundBindings.onThrow || 'throw', project.assets);
+              } else {
+                timerAccRef.current.set(key, acc);
+              }
+              break;
+            }
+          }
+        });
+
         // 4. Physics Integration, Static Solids & Tilemap Collisions
         const gravity = scene.environment.gravity;
         const staticSolids = bodies.filter(
-          (b) => b.alive && b.physics.enabled && b.physics.isStatic && b.role === 'platform'
+          (b) =>
+            b.alive &&
+            b.physics.enabled &&
+            b.kind !== 'hud-text' &&
+            b.kind !== 'text-box' &&
+            (b.collisionConfig?.response === 'solid' ||
+              (!b.collisionConfig && b.role === 'platform') ||
+              b.behavior?.mode === 'moving-platform') &&
+            (b.physics.isStatic || b.behavior?.mode === 'moving-platform')
         );
         const tileSize = scene.tilemap?.tileSize || 40;
         const tilesObj = scene.tilemap?.tiles || {};
@@ -974,6 +1136,9 @@ export const Engine2D: React.FC<Engine2DProps> = ({
             if (aabbOverlap(b.x, b.y, b.width, b.height, solid.x, solid.y, solid.width, solid.height)) {
               if (b.vy > 0) {
                 b.y = solid.y - b.height;
+                if (solid.lastStepDx !== 0) {
+                  b.x = Math.max(0, Math.min(worldW - b.width, b.x + solid.lastStepDx));
+                }
                 if (b.physics.bounce > 0.25 && b.vy > 120) {
                   b.vy = -b.vy * b.physics.bounce;
                 } else {
@@ -1088,7 +1253,102 @@ export const Engine2D: React.FC<Engine2DProps> = ({
         }
         projectilesRef.current = nextProj;
 
-        // 6. Entity-to-Entity Collision rules
+        // 6. General CollisionConfig + Behavior Triggers & Entity-to-Entity Collision Rules
+        for (const triggerBody of bodies) {
+          if (!triggerBody.alive || triggerBody.kind === 'hud-text' || triggerBody.kind === 'text-box') continue;
+          const behMode = triggerBody.behavior?.mode;
+          const colCfg = triggerBody.collisionConfig;
+
+          const effectiveAction =
+            colCfg?.onCollideAction && colCfg.onCollideAction !== 'none'
+              ? colCfg.onCollideAction
+              : behMode === 'collectible-bob'
+                ? 'collect'
+                : behMode === 'hazard-damage'
+                  ? 'damage'
+                  : behMode === 'bounce-pad'
+                    ? 'bounce'
+                    : behMode === 'scene-portal'
+                      ? 'go-to-scene'
+                      : 'none';
+
+          if (effectiveAction === 'none' && behMode !== 'checkpoint') continue;
+
+          const filterRole = colCfg?.filterRole || 'player';
+          for (const other of bodies) {
+            if (!other.alive || other.id === triggerBody.id || other.kind === 'hud-text' || other.kind === 'text-box') continue;
+            if (filterRole !== 'any' && other.role !== filterRole) continue;
+            if (!aabbOverlap(triggerBody.x, triggerBody.y, triggerBody.width, triggerBody.height, other.x, other.y, other.width, other.height)) {
+              continue;
+            }
+
+            if (behMode === 'checkpoint') {
+              const cpKey = `cp_${triggerBody.id}_${other.id}`;
+              if (!triggeredOnceRef.current.has(cpKey)) {
+                triggeredOnceRef.current.add(cpKey);
+                other.startX = triggerBody.x;
+                other.startY = triggerBody.y - other.height;
+                spawnParticleBurst(triggerBody.x + triggerBody.width / 2, triggerBody.y + triggerBody.height / 2, 'sparkle', 14);
+                audioEngine.playSound('coin', project.assets);
+                setBannerMessage(triggerBody.behavior?.message || `نقطه ذخیره «${triggerBody.name}» فعال شد`);
+              }
+              continue;
+            }
+
+            const cdKey = `gcol_${triggerBody.id}_${other.id}`;
+            if (now - (collisionCooldownRef.current.get(cdKey) ?? 0) < 600) continue;
+            collisionCooldownRef.current.set(cdKey, now);
+
+            const amount = colCfg?.actionAmount ?? triggerBody.behavior?.amount ?? 10;
+            if (effectiveAction === 'collect') {
+              triggerBody.alive = false;
+              triggerBody.visible = false;
+              varsRef.current.score += amount;
+              spawnParticleBurst(triggerBody.x + triggerBody.width / 2, triggerBody.y + triggerBody.height / 2, 'sparkle', 14);
+              audioEngine.playSound(colCfg?.sound || project.soundBindings.onCollect || 'coin', project.assets);
+              logsRef.current = [`جمع‌آوری ${triggerBody.name} (+${amount})`, ...logsRef.current.slice(0, 14)];
+            } else if (effectiveAction === 'damage') {
+              varsRef.current.health = Math.max(0, varsRef.current.health - amount);
+              cameraPosRef.current.shake = 9;
+              spawnParticleBurst(other.x + other.width / 2, other.y + other.height / 2, 'explosion', 14);
+              audioEngine.playSound(colCfg?.sound || project.soundBindings.onHit || 'hit', project.assets);
+              other.vy = -260;
+              logsRef.current = [`برخورد با ${triggerBody.name} (-${amount} جان)`, ...logsRef.current.slice(0, 14)];
+            } else if (effectiveAction === 'bounce') {
+              other.vy = -(amount > 100 ? amount : 680);
+              other.onGround = false;
+              spawnParticleBurst(other.x + other.width / 2, other.y + other.height, 'sparkle', 10);
+              audioEngine.playSound(colCfg?.sound || 'jump', project.assets);
+            } else if (effectiveAction === 'destroy-other') {
+              other.alive = false;
+              other.visible = false;
+              spawnParticleBurst(other.x + other.width / 2, other.y + other.height / 2, 'explosion', 14);
+            } else if (effectiveAction === 'destroy-self') {
+              triggerBody.alive = false;
+              triggerBody.visible = false;
+              spawnParticleBurst(triggerBody.x + triggerBody.width / 2, triggerBody.y + triggerBody.height / 2, 'explosion', 14);
+            } else if (effectiveAction === 'next-scene') {
+              const idx = project.scenes.findIndex((s) => s.id === scene.id);
+              const nextSc = project.scenes[idx + 1];
+              if (nextSc) {
+                loadSceneIntoSimulation(nextSc, false);
+              } else {
+                setBannerMessage('تبریک! تمام مراحل با موفقیت به پایان رسید!');
+              }
+              break;
+            } else if (effectiveAction === 'go-to-scene') {
+              const targetScId = colCfg?.targetSceneId || triggerBody.behavior?.nextSceneId;
+              const targetSc =
+                project.scenes.find((s) => s.id === targetScId || s.name === targetScId) ||
+                project.scenes[project.scenes.findIndex((s) => s.id === scene.id) + 1];
+              if (targetSc && targetSc.id !== scene.id) {
+                loadSceneIntoSimulation(targetSc, false);
+              }
+              break;
+            }
+          }
+        }
+
         scene.rules.forEach((rule) => {
           if (!rule.enabled || rule.triggerType !== 'on-collision') return;
           const b1s = bodies.filter((b) => b.alive && b.name === rule.targetName);
@@ -1241,8 +1501,8 @@ export const Engine2D: React.FC<Engine2DProps> = ({
             if (b.kind === 'hud-text' || b.kind === 'text-box') return;
 
             const animFloatY =
-              isPlaying && b.animation?.preset === 'float'
-                ? Math.sin(b.animTime * (b.animation.speed || 3)) * (b.animation.amplitude || 8)
+              isPlaying && (b.animation?.preset === 'float' || b.behavior?.mode === 'collectible-bob')
+                ? Math.sin(b.animTime * (b.animation?.speed || 3)) * (b.animation?.amplitude || 7)
                 : 0;
             const animScale =
               isPlaying && b.animation?.preset === 'pulse'
@@ -1259,23 +1519,35 @@ export const Engine2D: React.FC<Engine2DProps> = ({
 
             if (b.kind === 'sprite2d' && b.assetId) {
               const asset = project.assets.find((a) => a.id === b.assetId);
-              const img = asset ? imageCacheRef.current.get(asset.dataUrl) : undefined;
+              const cacheKey = asset
+                ? asset.dataUrl.startsWith('idb://')
+                  ? idbObjectUrlsRef.current.get(asset.id) || asset.dataUrl
+                  : asset.dataUrl
+                : '';
+              const img = cacheKey ? imageCacheRef.current.get(cacheKey) : undefined;
               if (img && img.complete && img.naturalWidth > 0) {
                 ctx.scale(b.facing, 1);
                 const cols = Math.max(1, b.animation?.spriteCols || 1);
                 const rows = Math.max(1, b.animation?.spriteRows || 1);
                 if (cols > 1 || rows > 1) {
-                  const totalFrames = cols * rows;
-                  const fps = Math.max(1, b.animation?.fps || 8);
-                  const frameIdx = isPlaying ? Math.floor(b.animTime * fps) % totalFrames : 0;
-                  const fCol = frameIdx % cols;
-                  const fRow = Math.floor(frameIdx / cols);
-                  const sw = img.naturalWidth / cols;
-                  const sh = img.naturalHeight / rows;
+                  const spriteState =
+                    !b.onGround && b.physics.useGravity
+                      ? 'jump'
+                      : Math.abs(b.vx) > 15
+                        ? 'walk'
+                        : 'idle';
+                  const coords = getSpritesheetFrameCoords(
+                    b.animation,
+                    spriteState,
+                    b.animTime,
+                    isPlaying
+                  );
+                  const sw = img.naturalWidth / coords.cols;
+                  const sh = img.naturalHeight / coords.rows;
                   ctx.drawImage(
                     img,
-                    fCol * sw,
-                    fRow * sh,
+                    coords.col * sw,
+                    coords.row * sh,
                     sw,
                     sh,
                     -b.width / 2,

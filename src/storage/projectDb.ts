@@ -6,6 +6,7 @@ import type {
   Model3DMetadata,
   RayanProject,
   TileType,
+  UIDataRecord,
 } from '../types/studio';
 import { parsePersianRules } from '../engine/ruleParser';
 
@@ -69,9 +70,16 @@ function onUpdate(api, dt) {
 }
 
 const DB_NAME = 'rayan_game_studio_db';
-const DB_VERSION = 2;
+const DB_VERSION = 4;
 const STORE_PROJECTS = 'projects';
-const STORE_ASSETS = 'assets';
+const STORE_ASSETS = 'binary_assets';
+const STORE_LEGACY_ASSETS = 'assets';
+const STORE_ASSET_CHUNKS = 'asset_chunks';
+const STORE_ASSET_DEPS = 'asset_dependencies';
+const STORE_APP_RECORDS = 'app_records';
+
+export const ASSET_CHUNK_SIZE_BYTES = 2 * 1024 * 1024; // 2 MB per chunk for large binary files
+const INLINE_DATA_URL_THRESHOLD = 512 * 1024; // 512 KB
 
 export interface StoredAssetRecord {
   id: string;
@@ -80,26 +88,210 @@ export interface StoredAssetRecord {
   format: AssetFormat;
   sizeBytes: number;
   createdAt: number;
-  buffer: ArrayBuffer;
+  updatedAt?: number;
+  /** Inline buffer for small files; null/empty when chunked into asset_chunks */
+  buffer?: ArrayBuffer | null;
   dataUrl?: string;
   modelMeta?: Model3DMetadata;
+  chunked?: boolean;
+  chunkCount?: number;
+  version?: number;
+  checksumSha256?: string;
+  versionHistory?: Array<{
+    version: number;
+    updatedAt: number;
+    sizeBytes: number;
+    checksumSha256: string;
+    note?: string;
+  }>;
+  linkedSceneIds?: string[];
+  linkedSceneNodeIds?: string[];
+  dependencyIds?: string[];
+}
+
+export interface StoredAssetChunk {
+  key: string; // `${assetId}::${chunkIndex}`
+  assetId: string;
+  chunkIndex: number;
+  data: ArrayBuffer;
+}
+
+export interface StoredAssetDependency {
+  id: string; // `${parentAssetId}::${relativePath}`
+  parentAssetId: string;
+  relativePath: string;
+  kind: 'texture' | 'material' | 'binary';
+  mimeType: string;
+  sizeBytes: number;
+  checksumSha256: string;
+  buffer: ArrayBuffer;
+  createdAt: number;
+}
+
+export interface RetrievedBinaryModel {
+  record: StoredAssetRecord;
+  buffer: ArrayBuffer;
+  dependencies: StoredAssetDependency[];
+}
+
+export interface ProjectAssetIntegrityReport {
+  ok: boolean;
+  totalReferencedAssets: number;
+  missingAssets: Array<{ assetId: string; referencedBy: string }>;
+  unlinkedAssets: string[];
+  chunkedModelsCount: number;
+  totalDependenciesCount: number;
 }
 
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = () => {
+    req.onupgradeneeded = (event) => {
       const db = req.result;
+      const tx = req.transaction;
+
       if (!db.objectStoreNames.contains(STORE_PROJECTS)) {
         db.createObjectStore(STORE_PROJECTS, { keyPath: 'id' });
       }
+
       if (!db.objectStoreNames.contains(STORE_ASSETS)) {
-        db.createObjectStore(STORE_ASSETS, { keyPath: 'id' });
+        const assetStore = db.createObjectStore(STORE_ASSETS, { keyPath: 'id' });
+        assetStore.createIndex('kind', 'kind', { unique: false });
+        assetStore.createIndex('checksumSha256', 'checksumSha256', { unique: false });
+      }
+
+      if (!db.objectStoreNames.contains(STORE_ASSET_CHUNKS)) {
+        const chunkStore = db.createObjectStore(STORE_ASSET_CHUNKS, { keyPath: 'key' });
+        chunkStore.createIndex('assetId', 'assetId', { unique: false });
+      }
+
+      if (!db.objectStoreNames.contains(STORE_ASSET_DEPS)) {
+        const depStore = db.createObjectStore(STORE_ASSET_DEPS, { keyPath: 'id' });
+        depStore.createIndex('parentAssetId', 'parentAssetId', { unique: false });
+      }
+
+      if (!db.objectStoreNames.contains(STORE_APP_RECORDS)) {
+        const recStore = db.createObjectStore(STORE_APP_RECORDS, { keyPath: 'id' });
+        recStore.createIndex('collectionKey', ['projectId', 'collectionId'], { unique: false });
+      }
+
+      // Migrate legacy v2 'assets' store into 'binary_assets' without data loss
+      if (
+        event.oldVersion < 3 &&
+        tx &&
+        db.objectStoreNames.contains(STORE_LEGACY_ASSETS) &&
+        db.objectStoreNames.contains(STORE_ASSETS)
+      ) {
+        const oldStore = tx.objectStore(STORE_LEGACY_ASSETS);
+        const newStore = tx.objectStore(STORE_ASSETS);
+        const cursorReq = oldStore.openCursor();
+        cursorReq.onsuccess = () => {
+          const cursor = cursorReq.result;
+          if (cursor) {
+            newStore.put(cursor.value);
+            cursor.continue();
+          }
+        };
       }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
+}
+
+export async function listAppRecords(
+  projectId: string,
+  collectionId: string
+): Promise<UIDataRecord[]> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_APP_RECORDS, 'readonly');
+    const store = tx.objectStore(STORE_APP_RECORDS);
+    const idx = store.index('collectionKey');
+    const req = idx.getAll([projectId, collectionId]);
+    req.onsuccess = () => {
+      const rows = ((req.result as UIDataRecord[]) || []).sort(
+        (a, b) => b.updatedAt - a.updatedAt
+      );
+      resolve(rows);
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+export async function putAppRecord(
+  projectId: string,
+  collectionId: string,
+  data: Record<string, string | number | boolean>,
+  existingId?: string
+): Promise<UIDataRecord> {
+  const db = await openDb();
+  const now = Date.now();
+  const id = existingId || `rec_${now}_${Math.random().toString(36).slice(2, 7)}`;
+  const record: UIDataRecord = {
+    id,
+    projectId,
+    collectionId,
+    data: { ...data },
+    createdAt: now,
+    updatedAt: now,
+  };
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(STORE_APP_RECORDS, 'readwrite');
+    tx.objectStore(STORE_APP_RECORDS).put(record);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+  return record;
+}
+
+export async function deleteAppRecord(id: string): Promise<void> {
+  const db = await openDb();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(STORE_APP_RECORDS, 'readwrite');
+    tx.objectStore(STORE_APP_RECORDS).delete(id);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function clearAppCollection(
+  projectId: string,
+  collectionId: string
+): Promise<void> {
+  const rows = await listAppRecords(projectId, collectionId);
+  if (rows.length === 0) return;
+  const db = await openDb();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(STORE_APP_RECORDS, 'readwrite');
+    const store = tx.objectStore(STORE_APP_RECORDS);
+    rows.forEach((r) => store.delete(r.id));
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function computeSha256Hex(buffer: ArrayBuffer): Promise<string> {
+  if (typeof crypto !== 'undefined' && crypto.subtle?.digest) {
+    try {
+      const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+      return Array.from(new Uint8Array(hashBuffer))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+    } catch {
+      // Fall through to deterministic FNV-1a 64-bit hex digest
+    }
+  }
+  const bytes = new Uint8Array(buffer);
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9e3779b9;
+  for (let i = 0; i < bytes.length; i++) {
+    h1 ^= bytes[i];
+    h1 = Math.imul(h1, 0x01000193);
+    h2 ^= bytes[i] ^ (i & 0xff);
+    h2 = Math.imul(h2, 0x85ebca6b);
+  }
+  return `${(h1 >>> 0).toString(16).padStart(8, '0')}${(h2 >>> 0).toString(16).padStart(8, '0')}`;
 }
 
 export function arrayBufferToDataUrl(buffer: ArrayBuffer, mimeType = 'application/octet-stream'): string {
@@ -112,7 +304,151 @@ export function arrayBufferToDataUrl(buffer: ArrayBuffer, mimeType = 'applicatio
   return `data:${mimeType};base64,${btoa(binary)}`;
 }
 
+async function writeChunksForAsset(
+  db: IDBDatabase,
+  assetId: string,
+  buffer: ArrayBuffer
+): Promise<number> {
+  const totalBytes = buffer.byteLength;
+  const chunkCount = Math.max(1, Math.ceil(totalBytes / ASSET_CHUNK_SIZE_BYTES));
+
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(STORE_ASSET_CHUNKS, 'readwrite');
+    const store = tx.objectStore(STORE_ASSET_CHUNKS);
+    const idx = store.index('assetId');
+    const getKeysReq = idx.getAllKeys(assetId);
+
+    getKeysReq.onsuccess = () => {
+      const existingKeys = getKeysReq.result || [];
+      existingKeys.forEach((k) => store.delete(k));
+
+      for (let i = 0; i < chunkCount; i++) {
+        const start = i * ASSET_CHUNK_SIZE_BYTES;
+        const end = Math.min(totalBytes, start + ASSET_CHUNK_SIZE_BYTES);
+        const slice = buffer.slice(start, end);
+        const chunkRecord: StoredAssetChunk = {
+          key: `${assetId}::${i}`,
+          assetId,
+          chunkIndex: i,
+          data: slice,
+        };
+        store.put(chunkRecord);
+      }
+    };
+
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+
+  return chunkCount;
+}
+
+async function readChunksForAsset(db: IDBDatabase, assetId: string): Promise<ArrayBuffer | null> {
+  const chunks = await new Promise<StoredAssetChunk[]>((resolve, reject) => {
+    const tx = db.transaction(STORE_ASSET_CHUNKS, 'readonly');
+    const store = tx.objectStore(STORE_ASSET_CHUNKS);
+    const idx = store.index('assetId');
+    const req = idx.getAll(assetId);
+    req.onsuccess = () => resolve((req.result as StoredAssetChunk[]) || []);
+    req.onerror = () => reject(req.error);
+  });
+
+  if (chunks.length === 0) return null;
+  chunks.sort((a, b) => a.chunkIndex - b.chunkIndex);
+  const totalLength = chunks.reduce((sum, c) => sum + c.data.byteLength, 0);
+  const combined = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const ch of chunks) {
+    combined.set(new Uint8Array(ch.data), offset);
+    offset += ch.data.byteLength;
+  }
+  return combined.buffer;
+}
+
+/**
+ * Registers or updates a binary asset/3D model in `binary_assets`.
+ * Automatically splits large buffers (> 2 MB) into `asset_chunks`, computes SHA-256 checksum,
+ * and initializes version tracking.
+ */
+export async function registerBinaryModel(params: {
+  id: string;
+  name: string;
+  kind: AssetKind;
+  format: AssetFormat;
+  buffer: ArrayBuffer;
+  dataUrl?: string;
+  modelMeta?: Model3DMetadata;
+  linkedSceneIds?: string[];
+  linkedSceneNodeIds?: string[];
+  dependencyIds?: string[];
+  note?: string;
+}): Promise<StoredAssetRecord> {
+  const db = await openDb();
+  const checksumSha256 = await computeSha256Hex(params.buffer);
+  const now = Date.now();
+  const shouldChunk = params.buffer.byteLength > ASSET_CHUNK_SIZE_BYTES;
+  let chunkCount = 1;
+
+  if (shouldChunk) {
+    chunkCount = await writeChunksForAsset(db, params.id, params.buffer);
+  }
+
+  const record: StoredAssetRecord = {
+    id: params.id,
+    name: params.name,
+    kind: params.kind,
+    format: params.format,
+    sizeBytes: params.buffer.byteLength,
+    createdAt: now,
+    updatedAt: now,
+    buffer: shouldChunk ? null : params.buffer,
+    dataUrl:
+      params.buffer.byteLength <= INLINE_DATA_URL_THRESHOLD
+        ? params.dataUrl
+        : `idb://${params.id}`,
+    modelMeta: params.modelMeta,
+    chunked: shouldChunk,
+    chunkCount,
+    version: 1,
+    checksumSha256,
+    versionHistory: [
+      {
+        version: 1,
+        updatedAt: now,
+        sizeBytes: params.buffer.byteLength,
+        checksumSha256,
+        note: params.note || 'نسخه اولیه واردشده',
+      },
+    ],
+    linkedSceneIds: params.linkedSceneIds || [],
+    linkedSceneNodeIds: params.linkedSceneNodeIds || [],
+    dependencyIds: params.dependencyIds || [],
+  };
+
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_ASSETS, 'readwrite');
+    const store = tx.objectStore(STORE_ASSETS);
+    const req = store.put(record);
+    req.onsuccess = () => resolve(record);
+    req.onerror = () => reject(req.error);
+  });
+}
+
 export async function saveAssetToDb(record: StoredAssetRecord): Promise<StoredAssetRecord> {
+  if (record.buffer && record.buffer.byteLength > 0) {
+    return registerBinaryModel({
+      id: record.id,
+      name: record.name,
+      kind: record.kind,
+      format: record.format,
+      buffer: record.buffer,
+      dataUrl: record.dataUrl,
+      modelMeta: record.modelMeta,
+      linkedSceneIds: record.linkedSceneIds,
+      linkedSceneNodeIds: record.linkedSceneNodeIds,
+      dependencyIds: record.dependencyIds,
+    });
+  }
   const db = await openDb();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_ASSETS, 'readwrite');
@@ -125,13 +461,243 @@ export async function saveAssetToDb(record: StoredAssetRecord): Promise<StoredAs
 
 export async function getAssetFromDb(id: string): Promise<StoredAssetRecord | null> {
   const db = await openDb();
-  return new Promise((resolve, reject) => {
+  const record = await new Promise<StoredAssetRecord | null>((resolve, reject) => {
     const tx = db.transaction(STORE_ASSETS, 'readonly');
     const store = tx.objectStore(STORE_ASSETS);
     const req = store.get(id);
     req.onsuccess = () => resolve((req.result as StoredAssetRecord | undefined) || null);
     req.onerror = () => reject(req.error);
   });
+
+  if (!record) return null;
+  if (record.chunked && !record.buffer) {
+    const reassembled = await readChunksForAsset(db, id);
+    if (reassembled) {
+      return { ...record, buffer: reassembled };
+    }
+  }
+  return record;
+}
+
+/**
+ * Registers a texture, MTL material file, or external .bin buffer dependency linked to a 3D model.
+ */
+export async function registerAssetDependency(
+  parentAssetId: string,
+  dep: {
+    relativePath: string;
+    kind: 'texture' | 'material' | 'binary';
+    mimeType: string;
+    buffer: ArrayBuffer;
+  }
+): Promise<StoredAssetDependency> {
+  const db = await openDb();
+  const checksumSha256 = await computeSha256Hex(dep.buffer);
+  const cleanRel = dep.relativePath.replace(/^\/+/, '');
+  const record: StoredAssetDependency = {
+    id: `${parentAssetId}::${cleanRel}`,
+    parentAssetId,
+    relativePath: cleanRel,
+    kind: dep.kind,
+    mimeType: dep.mimeType,
+    sizeBytes: dep.buffer.byteLength,
+    checksumSha256,
+    buffer: dep.buffer,
+    createdAt: Date.now(),
+  };
+
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(STORE_ASSET_DEPS, 'readwrite');
+    const store = tx.objectStore(STORE_ASSET_DEPS);
+    store.put(record);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+
+  // Update parent dependencyIds list if parent exists
+  const parent = await getAssetFromDb(parentAssetId);
+  if (parent) {
+    const nextDeps = Array.from(new Set([...(parent.dependencyIds || []), record.id]));
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE_ASSETS, 'readwrite');
+      const store = tx.objectStore(STORE_ASSETS);
+      store.put({
+        ...parent,
+        buffer: parent.chunked ? null : parent.buffer,
+        dependencyIds: nextDeps,
+        updatedAt: Date.now(),
+      });
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  return record;
+}
+
+export async function getAssetDependencies(
+  parentAssetId: string
+): Promise<StoredAssetDependency[]> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_ASSET_DEPS, 'readonly');
+    const store = tx.objectStore(STORE_ASSET_DEPS);
+    const idx = store.index('parentAssetId');
+    const req = idx.getAll(parentAssetId);
+    req.onsuccess = () => resolve((req.result as StoredAssetDependency[]) || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+/**
+ * Dedicated retrieval method for 3D models: reassembles chunked binaries and resolves all dependencies.
+ */
+export async function retrieveBinaryModel(assetId: string): Promise<RetrievedBinaryModel | null> {
+  const record = await getAssetFromDb(assetId);
+  if (!record || !record.buffer) return null;
+  const dependencies = await getAssetDependencies(assetId);
+  return {
+    record,
+    buffer: record.buffer,
+    dependencies,
+  };
+}
+
+/**
+ * Links an asset record in `binary_assets` to a specific scene and 3D node/entity ID.
+ */
+export async function linkAssetToScene(
+  assetId: string,
+  sceneId: string,
+  nodeOrEntityId: string
+): Promise<StoredAssetRecord | null> {
+  const db = await openDb();
+  const record = await new Promise<StoredAssetRecord | null>((resolve, reject) => {
+    const tx = db.transaction(STORE_ASSETS, 'readonly');
+    const req = tx.objectStore(STORE_ASSETS).get(assetId);
+    req.onsuccess = () => resolve((req.result as StoredAssetRecord | undefined) || null);
+    req.onerror = () => reject(req.error);
+  });
+  if (!record) return null;
+
+  const updated: StoredAssetRecord = {
+    ...record,
+    linkedSceneIds: Array.from(new Set([...(record.linkedSceneIds || []), sceneId])),
+    linkedSceneNodeIds: Array.from(
+      new Set([...(record.linkedSceneNodeIds || []), nodeOrEntityId])
+    ),
+    updatedAt: Date.now(),
+  };
+
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(STORE_ASSETS, 'readwrite');
+    tx.objectStore(STORE_ASSETS).put(updated);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+  return updated;
+}
+
+export async function unlinkAssetFromScene(
+  assetId: string,
+  nodeOrEntityId: string
+): Promise<void> {
+  const db = await openDb();
+  const record = await new Promise<StoredAssetRecord | null>((resolve, reject) => {
+    const tx = db.transaction(STORE_ASSETS, 'readonly');
+    const req = tx.objectStore(STORE_ASSETS).get(assetId);
+    req.onsuccess = () => resolve((req.result as StoredAssetRecord | undefined) || null);
+    req.onerror = () => reject(req.error);
+  });
+  if (!record) return;
+
+  const updated: StoredAssetRecord = {
+    ...record,
+    linkedSceneNodeIds: (record.linkedSceneNodeIds || []).filter((id) => id !== nodeOrEntityId),
+    updatedAt: Date.now(),
+  };
+
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(STORE_ASSETS, 'readwrite');
+    tx.objectStore(STORE_ASSETS).put(updated);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function getAssetsLinkedToScene(sceneId: string): Promise<StoredAssetRecord[]> {
+  const all = await listAssetsFromDb();
+  return all.filter((rec) => (rec.linkedSceneIds || []).includes(sceneId));
+}
+
+/**
+ * Increments asset version, stores new binary (chunked if large), and appends SHA-256 history.
+ */
+export async function bumpAssetVersion(
+  assetId: string,
+  newBuffer: ArrayBuffer,
+  note = 'به‌روزرسانی فایل',
+  updatedMeta?: Model3DMetadata
+): Promise<StoredAssetRecord> {
+  const db = await openDb();
+  const existing = await getAssetFromDb(assetId);
+  if (!existing) {
+    throw new Error(`دارایی با شناسه ${assetId} در IndexedDB یافت نشد.`);
+  }
+
+  const checksumSha256 = await computeSha256Hex(newBuffer);
+  const now = Date.now();
+  const nextVersion = (existing.version || 1) + 1;
+  const shouldChunk = newBuffer.byteLength > ASSET_CHUNK_SIZE_BYTES;
+  let chunkCount = 1;
+
+  if (shouldChunk) {
+    chunkCount = await writeChunksForAsset(db, assetId, newBuffer);
+  }
+
+  const history = [
+    ...(existing.versionHistory || [
+      {
+        version: existing.version || 1,
+        updatedAt: existing.createdAt,
+        sizeBytes: existing.sizeBytes,
+        checksumSha256: existing.checksumSha256 || 'legacy',
+      },
+    ]),
+    {
+      version: nextVersion,
+      updatedAt: now,
+      sizeBytes: newBuffer.byteLength,
+      checksumSha256,
+      note,
+    },
+  ];
+
+  const updated: StoredAssetRecord = {
+    ...existing,
+    sizeBytes: newBuffer.byteLength,
+    updatedAt: now,
+    buffer: shouldChunk ? null : newBuffer,
+    dataUrl:
+      newBuffer.byteLength <= INLINE_DATA_URL_THRESHOLD
+        ? arrayBufferToDataUrl(newBuffer)
+        : `idb://${assetId}`,
+    modelMeta: updatedMeta ?? existing.modelMeta,
+    chunked: shouldChunk,
+    chunkCount,
+    version: nextVersion,
+    checksumSha256,
+    versionHistory: history,
+  };
+
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(STORE_ASSETS, 'readwrite');
+    tx.objectStore(STORE_ASSETS).put(updated);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+
+  return { ...updated, buffer: newBuffer };
 }
 
 export async function listAssetsFromDb(): Promise<StoredAssetRecord[]> {
@@ -150,15 +716,107 @@ export async function listAssetsFromDb(): Promise<StoredAssetRecord[]> {
   });
 }
 
-export async function deleteAssetFromDb(id: string): Promise<void> {
+export async function listAllAssetDependenciesFromDb(): Promise<StoredAssetDependency[]> {
   const db = await openDb();
   return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_ASSETS, 'readwrite');
-    const store = tx.objectStore(STORE_ASSETS);
-    const req = store.delete(id);
-    req.onsuccess = () => resolve();
+    const tx = db.transaction(STORE_ASSET_DEPS, 'readonly');
+    const req = tx.objectStore(STORE_ASSET_DEPS).getAll();
+    req.onsuccess = () => resolve((req.result as StoredAssetDependency[]) || []);
     req.onerror = () => reject(req.error);
   });
+}
+
+export async function deleteAssetFromDb(id: string): Promise<void> {
+  const db = await openDb();
+  await new Promise<void>((resolve, reject) => {
+    const tx = db.transaction(
+      [STORE_ASSETS, STORE_ASSET_CHUNKS, STORE_ASSET_DEPS],
+      'readwrite'
+    );
+    tx.objectStore(STORE_ASSETS).delete(id);
+
+    const chunkIdx = tx.objectStore(STORE_ASSET_CHUNKS).index('assetId');
+    const cReq = chunkIdx.getAllKeys(id);
+    cReq.onsuccess = () => {
+      (cReq.result || []).forEach((k) => tx.objectStore(STORE_ASSET_CHUNKS).delete(k));
+    };
+
+    const depIdx = tx.objectStore(STORE_ASSET_DEPS).index('parentAssetId');
+    const dReq = depIdx.getAllKeys(id);
+    dReq.onsuccess = () => {
+      (dReq.result || []).forEach((k) => tx.objectStore(STORE_ASSET_DEPS).delete(k));
+    };
+
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+/**
+ * Verifies integrity of all scene-asset references and IndexedDB binary + dependency availability.
+ */
+export async function verifyProjectAssetIntegrity(
+  project: RayanProject
+): Promise<ProjectAssetIntegrityReport> {
+  const missingAssets: Array<{ assetId: string; referencedBy: string }> = [];
+  const referencedIds = new Set<string>();
+  const assetIdsInProject = new Set(project.assets.map((a) => a.id));
+
+  project.scenes.forEach((sc) => {
+    sc.entities.forEach((ent) => {
+      if (ent.assetId) {
+        referencedIds.add(ent.assetId);
+        if (!assetIdsInProject.has(ent.assetId)) {
+          missingAssets.push({ assetId: ent.assetId, referencedBy: `${sc.name} / ${ent.name}` });
+        }
+      }
+    });
+  });
+
+  (project.studio3dNodes || []).forEach((node) => {
+    if (node.assetId) {
+      referencedIds.add(node.assetId);
+      if (!assetIdsInProject.has(node.assetId)) {
+        missingAssets.push({ assetId: node.assetId, referencedBy: `Studio3D / ${node.name}` });
+      }
+    }
+  });
+
+  let chunkedModelsCount = 0;
+  let totalDependenciesCount = 0;
+
+  try {
+    const [storedRecords, deps] = await Promise.all([
+      listAssetsFromDb(),
+      listAllAssetDependenciesFromDb(),
+    ]);
+    const storedMap = new Map(storedRecords.map((r) => [r.id, r]));
+    chunkedModelsCount = storedRecords.filter((r) => r.chunked).length;
+    totalDependenciesCount = deps.length;
+
+    for (const asset of project.assets) {
+      const hasInline = Boolean(asset.dataUrl && !asset.dataUrl.startsWith('idb://'));
+      const inIdb = storedMap.has(asset.id);
+      if (!hasInline && !inIdb) {
+        missingAssets.push({ assetId: asset.id, referencedBy: `Asset: ${asset.name}` });
+      }
+    }
+  } catch {
+    // IndexedDB unavailable in headless tests
+  }
+
+  const unlinkedAssets = project.assets
+    .filter((a) => !referencedIds.has(a.id))
+    .map((a) => a.id);
+
+  return {
+    ok: missingAssets.length === 0,
+    totalReferencedAssets: referencedIds.size,
+    missingAssets,
+    unlinkedAssets,
+    chunkedModelsCount,
+    totalDependenciesCount,
+  };
 }
 
 /** Upgrades any legacy project record safely so scenes, camera, tilemap & customVariables always exist */
@@ -202,6 +860,9 @@ export function normalizeProject(raw: RayanProject): RayanProject {
     assets: raw.assets || [],
     studio3dNodes: Array.isArray(raw.studio3dNodes) ? raw.studio3dNodes : undefined,
     codeFiles: Array.isArray(raw.codeFiles) ? raw.codeFiles : createDefaultCodeFiles(raw.name),
+    uiPages: Array.isArray(raw.uiPages) ? raw.uiPages : undefined,
+    activeUiPageId: typeof raw.activeUiPageId === 'string' ? raw.activeUiPageId : undefined,
+    uiCollections: Array.isArray(raw.uiCollections) ? raw.uiCollections : undefined,
     scenes,
     activeSceneId,
     environment: activeScene.environment,
@@ -234,7 +895,7 @@ export async function listSavedProjects(): Promise<RayanProject[]> {
     req.onerror = () => reject(req.error);
   });
 
-  // Hydrate any assets whose binary buffer lives in STORE_ASSETS
+  // Hydrate small previews & sync version/dependency metadata from binary_assets
   return Promise.all(projects.map((proj) => hydrateProjectAssetsFromDb(proj)));
 }
 
@@ -243,18 +904,34 @@ export async function hydrateProjectAssetsFromDb(project: RayanProject): Promise
   let changed = false;
   const hydratedAssets = await Promise.all(
     project.assets.map(async (asset) => {
-      if (asset.dataUrl && !asset.dataUrl.startsWith('idb://')) {
-        return asset;
-      }
       try {
         const stored = await getAssetFromDb(asset.id);
         if (stored) {
-          changed = true;
-          return {
-            ...asset,
-            dataUrl: stored.dataUrl || arrayBufferToDataUrl(stored.buffer),
-            storedInIdb: true,
-          };
+          const needsDataUrl =
+            (!asset.dataUrl || asset.dataUrl.startsWith('idb://')) &&
+            stored.buffer &&
+            stored.buffer.byteLength <= INLINE_DATA_URL_THRESHOLD;
+          const nextDataUrl = needsDataUrl
+            ? stored.dataUrl || arrayBufferToDataUrl(stored.buffer!)
+            : asset.dataUrl;
+          if (
+            nextDataUrl !== asset.dataUrl ||
+            stored.version !== asset.version ||
+            stored.checksumSha256 !== asset.checksumSha256
+          ) {
+            changed = true;
+            return {
+              ...asset,
+              dataUrl: nextDataUrl,
+              storedInIdb: true,
+              version: stored.version ?? asset.version,
+              checksumSha256: stored.checksumSha256 ?? asset.checksumSha256,
+              chunkCount: stored.chunkCount ?? asset.chunkCount,
+              linkedSceneIds: stored.linkedSceneIds ?? asset.linkedSceneIds,
+              linkedSceneNodeIds: stored.linkedSceneNodeIds ?? asset.linkedSceneNodeIds,
+              versionHistory: stored.versionHistory ?? asset.versionHistory,
+            };
+          }
         }
       } catch {
         // ignore missing record
@@ -266,8 +943,15 @@ export async function hydrateProjectAssetsFromDb(project: RayanProject): Promise
 }
 
 export async function saveProjectToDb(project: RayanProject): Promise<RayanProject> {
+  // Keep STORE_PROJECTS lean by storing `idb://<id>` pointers for large binary assets stored in binary_assets
+  const compactAssets = (project.assets || []).map((a) =>
+    a.storedInIdb && a.sizeBytes > INLINE_DATA_URL_THRESHOLD
+      ? { ...a, dataUrl: `idb://${a.id}` }
+      : a
+  );
   const updated: RayanProject = normalizeProject({
     ...project,
+    assets: compactAssets,
     updatedAt: Date.now(),
   });
   const db = await openDb();

@@ -3,8 +3,22 @@ import http from 'http';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import fs from 'fs';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import dotenv from 'dotenv';
 import { GoogleGenAI, Type } from '@google/genai';
+
+const execFileAsync = promisify(execFile);
+
+async function probeBinary(cmd: string, args: string[]): Promise<{ available: boolean; version?: string }> {
+  try {
+    const { stdout, stderr } = await execFileAsync(cmd, args, { timeout: 2500 });
+    const firstLine = (stdout || stderr || '').trim().split('\n')[0]?.slice(0, 120);
+    return { available: true, version: firstLine || 'installed' };
+  } catch {
+    return { available: false };
+  }
+}
 
 dotenv.config();
 
@@ -18,6 +32,21 @@ async function startServer() {
 
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true, studio: 'rayan', aiConfigured: Boolean(process.env.GEMINI_API_KEY) });
+  });
+
+  app.get('/api/export/capabilities', async (_req, res) => {
+    const [java, gradle, electron] = await Promise.all([
+      probeBinary('java', ['-version']),
+      probeBinary('gradle', ['--version']),
+      probeBinary('npx', ['electron', '--version']),
+    ]);
+    res.json({
+      java,
+      gradle,
+      electron,
+      browserExportFormats: ['html', 'pwa-zip', 'capacitor-android-source-zip', 'electron-windows-source-zip'],
+      directApkCompiledOnHost: Boolean(java.available && gradle.available),
+    });
   });
 
   app.post('/api/ai/generate-rules', async (req, res) => {

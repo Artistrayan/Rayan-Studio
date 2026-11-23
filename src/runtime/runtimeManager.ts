@@ -4,6 +4,7 @@
  * Rayan Studio - Production Multi-Language Runtime Manager
  * Manages isolated Web Workers for JavaScript, Python (Pyodide), and Lua (Wasmoon).
  * Enforces permission checks, timeouts, stream output, and genuine error reporting.
+ * Uses Node.js `node:vm` isolated contexts in server/Vitest environments without Web Workers (zero `new Function` fallback).
  */
 
 import { permissionManager } from '../security/permissionManager';
@@ -77,7 +78,19 @@ class RuntimeManager {
     }
 
     if (typeof Worker === 'undefined') {
-      return 'WebAssembly Runtime (محیط تست)';
+      if (language === 'lua') {
+        try {
+          const { LuaFactory } = await import('wasmoon');
+          const factory = new LuaFactory();
+          const lua = await factory.createEngine();
+          const ver = String(await lua.doString('return _VERSION'));
+          lua.global.close();
+          return `${ver} (Wasmoon Wasm)`;
+        } catch {
+          return 'Lua 5.4 (Wasmoon)';
+        }
+      }
+      return `${language} Runtime (Node Sandbox)`;
     }
 
     try {
@@ -116,7 +129,7 @@ class RuntimeManager {
     const logs: string[] = [];
     const timeoutMs = options.timeoutMs ?? this.defaultTimeoutMs;
 
-    // 1. Verify user permission
+    // 1. Verify user permission (never auto-granted without consent)
     const hasPerm = await permissionManager.requestPermission(
       'script:execute',
       `اجرای اسکریپت به زبان ${language}`
@@ -143,9 +156,9 @@ class RuntimeManager {
       };
     }
 
-    // 3. Fallback for Node.js / unit test environments without Worker
+    // 3. Isolated Node VM / Wasm runner when running in Node/Vitest headless tests without Web Worker
     if (typeof Worker === 'undefined') {
-      return this.executeInTestEnvironment(executionId, language, code, options);
+      return this.executeInNodeSandbox(executionId, language, code, options);
     }
 
     // 4. Dedicated Web Worker execution with hard timeout
@@ -250,9 +263,10 @@ class RuntimeManager {
   }
 
   /**
-   * Lightweight runner for headless Node/Vitest test environments where Worker isn't globally mocked.
+   * Isolated execution for Node.js/Vitest environments using `node:vm` (with real timeout & context isolation)
+   * and real Wasmoon engine for Lua—never using main-thread `new Function()`.
    */
-  private async executeInTestEnvironment(
+  private async executeInNodeSandbox(
     executionId: string,
     language: CodeFileLanguage,
     code: string,
@@ -260,43 +274,122 @@ class RuntimeManager {
   ): Promise<ExecutionResult> {
     const startTime = performance.now();
     const logs: string[] = [];
+    const timeoutMs = options.timeoutMs ?? this.defaultTimeoutMs;
+    const workingContext = {
+      score: options.context?.score ?? 0,
+      health: options.context?.health ?? 100,
+      vars: { ...(options.context?.vars || {}) },
+    };
+
+    const sandboxApi = {
+      get score() {
+        return workingContext.score;
+      },
+      addScore: (d: number) => {
+        workingContext.score += Number(d);
+        logs.push(`[score += ${d}]`);
+      },
+      setScore: (v: number) => {
+        workingContext.score = Number(v);
+      },
+      get health() {
+        return workingContext.health;
+      },
+      setHealth: (h: number) => {
+        workingContext.health = Math.max(0, Number(h));
+      },
+      get vars() {
+        return workingContext.vars;
+      },
+      setVar: (k: string, v: number) => {
+        workingContext.vars[k] = Number(v);
+      },
+      log: (...a: unknown[]) => logs.push(a.map(String).join(' ')),
+      showMessage: (msg: string) => logs.push(`[پیام بازی]: ${msg}`),
+      playSound: (name: string) => logs.push(`[پخش صدا]: ${name}`),
+    };
 
     if (language === 'javascript' || language === 'typescript') {
       try {
-        const workingContext = {
-          score: options.context?.score ?? 0,
-          health: options.context?.health ?? 100,
-          vars: { ...(options.context?.vars || {}) },
-        };
-        const sandboxApi = {
-          score: workingContext.score,
-          addScore: (d: number) => {
-            workingContext.score += d;
-            logs.push(`[score += ${d}]`);
+        const vm = await import('node:vm');
+        const vmContext = vm.createContext(
+          {
+            api: sandboxApi,
+            console: {
+              log: (...a: unknown[]) => logs.push(a.map(String).join(' ')),
+              warn: (...a: unknown[]) => logs.push(`هشدار: ${a.map(String).join(' ')}`),
+              error: (...a: unknown[]) => logs.push(`خطا: ${a.map(String).join(' ')}`),
+            },
+            Math,
+            JSON,
+            Number,
+            String,
+            Boolean,
+            Array,
+            Object,
           },
-          setScore: (v: number) => {
-            workingContext.score = v;
-          },
-          health: workingContext.health,
-          setHealth: (h: number) => {
-            workingContext.health = h;
-          },
-          vars: workingContext.vars,
-          setVar: (k: string, v: number) => {
-            workingContext.vars[k] = v;
-          },
-          log: (...a: unknown[]) => logs.push(a.map(String).join(' ')),
-        };
-        const fn = new Function('api', 'console', `"use strict"; ${code}`);
-        fn(sandboxApi, { log: (...a: unknown[]) => logs.push(a.map(String).join(' ')) });
+          {
+            codeGeneration: { strings: false, wasm: false },
+          }
+        );
+
+        const wrapped = `"use strict";\n${code}\nif (typeof onStart === "function") onStart(api);\nif (typeof onUpdate === "function") onUpdate(api, 0.016);`;
+        vm.runInContext(wrapped, vmContext, { timeout: timeoutMs, filename: 'user-script.js' });
+
         return {
           executionId,
           language,
           ok: true,
+          version: 'Node VM Isolated Context',
           logs,
           finalState: workingContext,
           durationMs: performance.now() - startTime,
         };
+      } catch (err) {
+        return {
+          executionId,
+          language,
+          ok: false,
+          logs,
+          error: err instanceof Error ? `${err.name}: ${err.message}` : String(err),
+          durationMs: performance.now() - startTime,
+        };
+      }
+    }
+
+    if (language === 'lua') {
+      try {
+        const { LuaFactory } = await import('wasmoon');
+        const factory = new LuaFactory();
+        const lua = await factory.createEngine();
+        try {
+          lua.global.set('print', (...args: unknown[]) => {
+            logs.push(args.map((a) => String(a)).join('\t'));
+          });
+          lua.global.set('api', {
+            get score() {
+              return workingContext.score;
+            },
+            add_score: (d: number) => sandboxApi.addScore(d),
+            set_score: (v: number) => sandboxApi.setScore(v),
+            set_health: (h: number) => sandboxApi.setHealth(h),
+            set_var: (k: string, v: number) => sandboxApi.setVar(k, v),
+            log: (...a: unknown[]) => sandboxApi.log(...a),
+          });
+          const ver = String(await lua.doString('return _VERSION'));
+          await lua.doString(code);
+          return {
+            executionId,
+            language,
+            ok: true,
+            version: `${ver} (Wasmoon Wasm)`,
+            logs,
+            finalState: workingContext,
+            durationMs: performance.now() - startTime,
+          };
+        } finally {
+          lua.global.close();
+        }
       } catch (err) {
         return {
           executionId,
@@ -312,8 +405,9 @@ class RuntimeManager {
     return {
       executionId,
       language,
-      ok: true,
-      logs: [`[Headless Test Environment] ${language} syntax accepted.`],
+      ok: false,
+      logs,
+      error: `اجرای زبان ${language} نیازمند محیط مرورگر با Web Worker و WebAssembly است.`,
       durationMs: performance.now() - startTime,
     };
   }

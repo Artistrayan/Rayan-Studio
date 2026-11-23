@@ -1,10 +1,13 @@
 import React, { useRef, useState } from 'react';
 import {
   ArrowDown,
+  ArrowLeft,
+  ArrowRight,
   ArrowUp,
   Box,
   Bug,
   Copy,
+  Edit3,
   Eraser,
   Eye,
   EyeOff,
@@ -39,13 +42,13 @@ import type {
   BoxChildLayer,
   BoxLayerKind,
   EngineMode,
+  EntityBehaviorMode,
+  EntityCollisionConfig,
   EntityKind,
   EntityRole,
   GameEntity,
   GameScene,
   Model3DPresetType,
-  RayanAsset,
-  AssetFormat,
   RayanProject,
   ScreenPreset,
   Shape2DType,
@@ -55,8 +58,13 @@ import { Engine2D, type RuntimeStatsPayload } from '../engine/Engine2D';
 import { Engine3D } from '../engine/Engine3D';
 import { audioEngine } from '../engine/audioEngine';
 import { parsePersianRules } from '../engine/ruleParser';
-import { parseAndInspect3DModelFile } from '../engine/threeModels';
-import { arrayBufferToDataUrl, saveAssetToDb } from '../storage/projectDb';
+import { importAssetsFromFileList } from '../engine/assetManager';
+import {
+  getDefaultCollisionConfig,
+  pickModel3DAnimationClip,
+  studio3dNodesToGameEntities,
+} from '../engine/gameRuntimeHelpers';
+import { linkAssetToScene } from '../storage/projectDb';
 import { ColorPickerField } from './ColorPickerField';
 
 interface SceneEditorWorkspaceProps {
@@ -202,6 +210,8 @@ export const SceneEditorWorkspace: React.FC<SceneEditorWorkspaceProps> = ({
   const [muted, setMuted] = useState(audioEngine.isMuted());
   const [newVarName, setNewVarName] = useState('');
   const [newVarVal, setNewVarVal] = useState(0);
+  const [editingSceneId, setEditingSceneId] = useState<string | null>(null);
+  const [sceneNameDraft, setSceneNameDraft] = useState('');
 
   const [runtimeStats, setRuntimeStats] = useState<RuntimeStatsPayload>({
     score: project.variables.score,
@@ -341,6 +351,73 @@ export const SceneEditorWorkspace: React.FC<SceneEditorWorkspaceProps> = ({
       updatedAt: Date.now(),
     }));
     setSelectedEntityId(next.entities[0]?.id || null);
+  };
+
+  const duplicateActiveScene = () => {
+    const newId = `scene_${Date.now()}`;
+    const clonedEntities = JSON.parse(JSON.stringify(activeScene.entities)) as GameEntity[];
+    const copy: GameScene = {
+      ...JSON.parse(JSON.stringify(activeScene)),
+      id: newId,
+      name: `${activeScene.name} (کپی)`,
+      entities: clonedEntities,
+      rules: parsePersianRules(activeScene.rulesText, clonedEntities).rules,
+    };
+    onUpdateProject((prev) => ({
+      ...prev,
+      scenes: [...prev.scenes, copy],
+      activeSceneId: newId,
+      environment: copy.environment,
+      camera: copy.camera,
+      tilemap: copy.tilemap,
+      entities: copy.entities,
+      rulesText: copy.rulesText,
+      rules: copy.rules,
+      updatedAt: Date.now(),
+    }));
+    setSelectedEntityId(clonedEntities[0]?.id || null);
+  };
+
+  const moveActiveSceneOrder = (dir: -1 | 1) => {
+    onUpdateProject((prev) => {
+      const idx = prev.scenes.findIndex((s) => s.id === prev.activeSceneId);
+      const targetIdx = idx + dir;
+      if (idx === -1 || targetIdx < 0 || targetIdx >= prev.scenes.length) return prev;
+      const nextScenes = [...prev.scenes];
+      const [moved] = nextScenes.splice(idx, 1);
+      nextScenes.splice(targetIdx, 0, moved);
+      return { ...prev, scenes: nextScenes, updatedAt: Date.now() };
+    });
+  };
+
+  const commitSceneRename = (sceneId: string) => {
+    const trimmed = sceneNameDraft.trim();
+    setEditingSceneId(null);
+    if (!trimmed) return;
+    onUpdateProject((prev) => ({
+      ...prev,
+      scenes: prev.scenes.map((s) => (s.id === sceneId ? { ...s, name: trimmed } : s)),
+      updatedAt: Date.now(),
+    }));
+  };
+
+  const importStudio3DLayoutToScene = () => {
+    if (!project.studio3dNodes || project.studio3dNodes.length === 0) return;
+    const converted = studio3dNodesToGameEntities(project.studio3dNodes);
+    if (converted.length === 0) return;
+
+    onUpdateProject((prev) => {
+      const existingNonS3d = prev.entities.filter((e) => !e.id.startsWith('s3d_'));
+      const mergedEntities = [...existingNonS3d, ...converted];
+      return {
+        ...prev,
+        engineMode: '3d',
+        entities: mergedEntities,
+        rules: parsePersianRules(prev.rulesText, mergedEntities).rules,
+        updatedAt: Date.now(),
+      };
+    });
+    setSelectedEntityId(converted[0].id);
   };
 
   const handlePaintTile = (col: number, row: number, tile: TileType | null) => {
@@ -926,133 +1003,117 @@ export const SceneEditorWorkspace: React.FC<SceneEditorWorkspaceProps> = ({
   const handleQuickUpload = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
     setQuickUploadError(null);
-    const file = files[0];
-    const ext = file.name.split('.').pop()?.toLowerCase() || '';
-    const isImg = ['png', 'jpg', 'jpeg', 'webp', 'svg'].includes(ext);
-    const is3DModel = ['glb', 'gltf', 'obj', 'stl', 'fbx', 'ply', 'usd', 'usdz'].includes(ext);
-    if (!isImg && !is3DModel) {
-      setQuickUploadError(`فرمت «${file.name}» پشتیبانی نمی‌شود.`);
-      return;
-    }
 
     try {
-      const buffer = await file.arrayBuffer();
-      if (!buffer || buffer.byteLength === 0) {
-        throw new Error('فایل خالی است.');
+      const res = await importAssetsFromFileList(files);
+      if (res.assets.length === 0) {
+        setQuickUploadError(res.errors[0] || 'هیچ فایل معتبری وارد نشد.');
+        return;
       }
 
-      const format = (ext === 'jpeg' ? 'jpg' : ext) as AssetFormat;
-      const mimeType = isImg
-        ? format === 'svg'
-          ? 'image/svg+xml'
-          : `image/${format === 'jpg' ? 'jpeg' : format}`
-        : format === 'glb'
-          ? 'model/gltf-binary'
-          : format === 'gltf'
-            ? 'model/gltf+json'
-            : 'application/octet-stream';
-      const dataUrl = arrayBufferToDataUrl(buffer, mimeType);
+      const newEntities: GameEntity[] = [];
+      const newNodes3D: NonNullable<RayanProject['studio3dNodes']> = [];
 
-      let modelMeta = undefined;
-      if (is3DModel) {
-        const parsed = await parseAndInspect3DModelFile(buffer, format, '#38bdf8');
-        modelMeta = parsed.meta;
+      for (const asset of res.assets) {
+        if (asset.kind === 'audio') continue;
+        const isImg = asset.kind === 'image';
+        const is3DModel = asset.kind === 'model3d';
+        const entId = `ent_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        const animNames = asset.modelMeta?.animationNames || [];
+
+        const ent: GameEntity = {
+          id: entId,
+          name: asset.name,
+          role: 'prop',
+          kind: isImg ? 'sprite2d' : 'model3d-asset',
+          assetId: asset.id,
+          x: is3DModel ? 0 : 240 + newEntities.length * 40,
+          y: is3DModel ? 0 : 240,
+          z: 0,
+          width: is3DModel ? 1.5 : 84,
+          height: is3DModel ? 1.5 : 84,
+          depth: 1.5,
+          rotationX: 0,
+          rotationY: 0,
+          rotationZ: 0,
+          color: '#F8FAFC',
+          opacity: 1,
+          visible: true,
+          physics: {
+            enabled: true,
+            isStatic: false,
+            useGravity: false,
+            mass: 1,
+            bounce: 0.1,
+            friction: 0.85,
+            collider: 'box',
+          },
+          animation:
+            is3DModel && animNames.length > 0
+              ? {
+                  preset: 'none',
+                  speed: 1,
+                  amplitude: 0,
+                  spriteCols: 1,
+                  spriteRows: 1,
+                  fps: 8,
+                  idleClip: pickModel3DAnimationClip(undefined, animNames, 'idle') || animNames[0],
+                  walkClip: pickModel3DAnimationClip(undefined, animNames, 'walk') || animNames[0],
+                  jumpClip: pickModel3DAnimationClip(undefined, animNames, 'jump') || undefined,
+                }
+              : undefined,
+          collisionConfig: getDefaultCollisionConfig('prop'),
+        };
+
+        newEntities.push(ent);
+        await linkAssetToScene(asset.id, project.activeSceneId, entId).catch(() => null);
+
+        if (is3DModel) {
+          newNodes3D.push({
+            id: `node_${entId}`,
+            name: asset.name,
+            kind: 'model-asset',
+            assetId: asset.id,
+            format: asset.format.toUpperCase(),
+            position: [newNodes3D.length * 2, 0, 0],
+            rotation: [0, 0, 0],
+            scale: [1, 1, 1],
+            color: '#38bdf8',
+            visible: true,
+            locked: false,
+            parentId: null,
+            layerId: 'characters',
+            folder: 'مدل‌های وارد شده',
+            animations: animNames,
+          });
+        }
       }
 
-      const assetId = `asset_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
-      const assetName = file.name.replace(/\.[^.]+$/, '');
-
-      await saveAssetToDb({
-        id: assetId,
-        name: assetName,
-        kind: isImg ? 'image' : 'model3d',
-        format,
-        sizeBytes: file.size,
-        createdAt: Date.now(),
-        buffer,
-        dataUrl,
-        modelMeta,
-      });
-
-      const asset: RayanAsset = {
-        id: assetId,
-        name: assetName,
-        kind: isImg ? 'image' : 'model3d',
-        format,
-        dataUrl,
-        sizeBytes: file.size,
-        createdAt: Date.now(),
-        modelMeta,
-        storedInIdb: true,
-      };
-
-      const entId = `ent_${Date.now()}_u`;
-      const newEnt: GameEntity = {
-        id: entId,
-        name: asset.name,
-        role: 'prop',
-        kind: isImg ? 'sprite2d' : 'model3d-asset',
-        assetId: asset.id,
-        x: is3DModel ? 0 : 240,
-        y: is3DModel ? 0 : 240,
-        z: 0,
-        width: is3DModel ? 1.5 : 84,
-        height: is3DModel ? 1.5 : 84,
-        depth: 1.5,
-        rotationX: 0,
-        rotationY: 0,
-        rotationZ: 0,
-        color: '#F8FAFC',
-        opacity: 1,
-        visible: true,
-        physics: {
-          enabled: true,
-          isStatic: false,
-          useGravity: false,
-          mass: 1,
-          bounce: 0.1,
-          friction: 0.85,
-          collider: 'box',
-        },
-      };
-
+      const has3D = res.assets.some((a) => a.kind === 'model3d');
       onUpdateProject(
         (prev) => ({
           ...prev,
-          engineMode: is3DModel ? '3d' : prev.engineMode,
-          assets: [asset, ...prev.assets],
-          entities: [...prev.entities, newEnt],
-          studio3dNodes: is3DModel
-            ? [
-                ...(prev.studio3dNodes || []),
-                {
-                  id: `node_${entId}`,
-                  name: asset.name,
-                  kind: 'model-asset',
-                  assetId: asset.id,
-                  format: format.toUpperCase(),
-                  position: [0, 0, 0],
-                  rotation: [0, 0, 0],
-                  scale: [1, 1, 1],
-                  color: '#38bdf8',
-                  visible: true,
-                  locked: false,
-                  parentId: null,
-                  layerId: 'characters',
-                  folder: 'مدل‌های وارد شده',
-                  animations: modelMeta?.animationNames,
-                },
-              ]
-            : prev.studio3dNodes,
+          engineMode: has3D ? '3d' : prev.engineMode,
+          assets: [...res.assets, ...prev.assets],
+          entities: [...prev.entities, ...newEntities],
+          studio3dNodes:
+            newNodes3D.length > 0
+              ? [...(prev.studio3dNodes || []), ...newNodes3D]
+              : prev.studio3dNodes,
           updatedAt: Date.now(),
         }),
         false,
         true
       );
-      setSelectedEntityId(entId);
+      if (newEntities[0]) {
+        setSelectedEntityId(newEntities[0].id);
+      }
+      if (res.errors.length > 0) {
+        setQuickUploadError(res.errors[0]);
+      }
     } catch (err) {
       setQuickUploadError(
-        `خطا در بارگذاری «${file.name}»: ${err instanceof Error ? err.message : 'فایل نامعتبر'}`
+        `خطا در بارگذاری فایل‌ها: ${err instanceof Error ? err.message : 'فایل نامعتبر'}`
       );
     }
   };
@@ -1252,6 +1313,17 @@ export const SceneEditorWorkspace: React.FC<SceneEditorWorkspaceProps> = ({
                 >
                   <Box className="w-3.5 h-3.5" />
                   <span>استودیو چندمدلی 3D</span>
+                </button>
+              )}
+              {project.studio3dNodes && project.studio3dNodes.length > 0 && (
+                <button
+                  type="button"
+                  onClick={importStudio3DLayoutToScene}
+                  title="تبدیل مدل‌ها و چیدمان استودیو 3D به اشیای قابل اجرای این صحنه"
+                  className="flex items-center gap-1 px-2 py-1 rounded-md text-xs font-semibold bg-emerald-950/70 border border-emerald-600/50 text-emerald-300 hover:bg-emerald-900 hover:text-white transition-colors whitespace-nowrap"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>وارد کردن از استودیو 3D ({project.studio3dNodes.length})</span>
                 </button>
               )}
             </div>
@@ -1475,7 +1547,8 @@ export const SceneEditorWorkspace: React.FC<SceneEditorWorkspaceProps> = ({
                 <input
                   ref={quickFileRef}
                   type="file"
-                  accept=".png,.jpg,.jpeg,.webp,.svg,.glb,.gltf,.obj,.stl,.fbx,.ply,.usd,.usdz"
+                  multiple
+                  accept=".png,.jpg,.jpeg,.webp,.svg,.glb,.gltf,.obj,.stl,.fbx,.ply,.usd,.usdz,.mtl,.bin"
                   className="hidden"
                   onChange={(e) => {
                     void handleQuickUpload(e.target.files);
@@ -1857,20 +1930,41 @@ export const SceneEditorWorkspace: React.FC<SceneEditorWorkspaceProps> = ({
             <div className="w-full flex items-center justify-between gap-2 px-1 shrink-0 overflow-x-auto">
               <div className="flex items-center gap-1.5">
                 <span className="text-[11px] text-slate-500 shrink-0">صحنه‌ها / مراحل:</span>
-                {project.scenes.map((sc) => (
-                  <button
-                    key={sc.id}
-                    type="button"
-                    onClick={() => switchActiveScene(sc.id)}
-                    className={`px-2.5 py-1 rounded-md text-xs font-medium whitespace-nowrap transition-colors border ${
-                      sc.id === project.activeSceneId
-                        ? 'border-amber-500/60 bg-amber-500/15 text-amber-300'
-                        : 'border-slate-800 bg-[#131822] text-slate-400 hover:text-slate-200'
-                    }`}
-                  >
-                    {sc.name}
-                  </button>
-                ))}
+                {project.scenes.map((sc) =>
+                  editingSceneId === sc.id ? (
+                    <input
+                      key={sc.id}
+                      type="text"
+                      autoFocus
+                      value={sceneNameDraft}
+                      onChange={(e) => setSceneNameDraft(e.target.value)}
+                      onBlur={() => commitSceneRename(sc.id)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') commitSceneRename(sc.id);
+                        if (e.key === 'Escape') setEditingSceneId(null);
+                      }}
+                      className="px-2 py-1 rounded-md text-xs bg-[#0B0E14] border border-amber-400 text-slate-100 w-32"
+                    />
+                  ) : (
+                    <button
+                      key={sc.id}
+                      type="button"
+                      onClick={() => switchActiveScene(sc.id)}
+                      onDoubleClick={() => {
+                        setEditingSceneId(sc.id);
+                        setSceneNameDraft(sc.name);
+                      }}
+                      title="برای تغییر نام دوبار کلیک کنید"
+                      className={`px-2.5 py-1 rounded-md text-xs font-medium whitespace-nowrap transition-colors border ${
+                        sc.id === project.activeSceneId
+                          ? 'border-amber-500/60 bg-amber-500/15 text-amber-300'
+                          : 'border-slate-800 bg-[#131822] text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      {sc.name}
+                    </button>
+                  )
+                )}
                 <button
                   type="button"
                   onClick={addNewScene}
@@ -1879,6 +1973,45 @@ export const SceneEditorWorkspace: React.FC<SceneEditorWorkspaceProps> = ({
                   <Plus className="w-3 h-3" />
                   مرحله جدید
                 </button>
+                <button
+                  type="button"
+                  onClick={duplicateActiveScene}
+                  title="کپی صحنه فعلی"
+                  className="p-1.5 rounded-md border border-slate-800 bg-[#131822] text-slate-400 hover:text-sky-300"
+                >
+                  <Copy className="w-3 h-3" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEditingSceneId(activeScene.id);
+                    setSceneNameDraft(activeScene.name);
+                  }}
+                  title="تغییر نام صحنه فعلی"
+                  className="p-1.5 rounded-md border border-slate-800 bg-[#131822] text-slate-400 hover:text-amber-300"
+                >
+                  <Edit3 className="w-3 h-3" />
+                </button>
+                {project.scenes.length > 1 && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => moveActiveSceneOrder(-1)}
+                      title="جابجایی صحنه به راست"
+                      className="p-1.5 rounded-md border border-slate-800 bg-[#131822] text-slate-400 hover:text-slate-200"
+                    >
+                      <ArrowRight className="w-3 h-3" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => moveActiveSceneOrder(1)}
+                      title="جابجایی صحنه به چپ"
+                      className="p-1.5 rounded-md border border-slate-800 bg-[#131822] text-slate-400 hover:text-slate-200"
+                    >
+                      <ArrowLeft className="w-3 h-3" />
+                    </button>
+                  </>
+                )}
               </div>
               {project.scenes.length > 1 && (
                 <button
@@ -2225,70 +2358,386 @@ export const SceneEditorWorkspace: React.FC<SceneEditorWorkspaceProps> = ({
                       </div>
 
                       {selectedEntity.kind === 'sprite2d' && (
-                        <div className="grid grid-cols-3 gap-2 pt-1 tabular-nums">
-                          <div className="space-y-1">
-                            <label className="text-slate-400">ستون اسپرایت</label>
-                            <NumericInput
-                              min={1}
-                              max={32}
-                              value={selectedEntity.animation?.spriteCols ?? 1}
-                              onChange={(val) =>
-                                updateEntity(selectedEntity.id, {
-                                  animation: {
-                                    preset: selectedEntity.animation?.preset ?? 'none',
-                                    speed: selectedEntity.animation?.speed ?? 3,
-                                    amplitude: selectedEntity.animation?.amplitude ?? 8,
-                                    spriteCols: Math.max(1, Math.round(val)),
-                                    spriteRows: selectedEntity.animation?.spriteRows ?? 1,
-                                    fps: selectedEntity.animation?.fps ?? 8,
-                                  },
-                                })
-                              }
-                              className="w-full px-2 py-1 rounded border border-slate-700 bg-[#0B0E14] text-slate-100 text-center font-mono"
-                            />
+                        <>
+                          <div className="grid grid-cols-3 gap-2 pt-1 tabular-nums">
+                            <div className="space-y-1">
+                              <label className="text-slate-400">ستون اسپرایت</label>
+                              <NumericInput
+                                min={1}
+                                max={32}
+                                value={selectedEntity.animation?.spriteCols ?? 1}
+                                onChange={(val) =>
+                                  updateEntity(selectedEntity.id, {
+                                    animation: {
+                                      preset: selectedEntity.animation?.preset ?? 'none',
+                                      speed: selectedEntity.animation?.speed ?? 3,
+                                      amplitude: selectedEntity.animation?.amplitude ?? 8,
+                                      ...selectedEntity.animation,
+                                      spriteCols: Math.max(1, Math.round(val)),
+                                      spriteRows: selectedEntity.animation?.spriteRows ?? 1,
+                                      fps: selectedEntity.animation?.fps ?? 8,
+                                    },
+                                  })
+                                }
+                                className="w-full px-2 py-1 rounded border border-slate-700 bg-[#0B0E14] text-slate-100 text-center font-mono"
+                              />
+                            </div>
+                            <div className="space-y-1">
+                              <label className="text-slate-400">سطر اسپرایت</label>
+                              <NumericInput
+                                min={1}
+                                max={32}
+                                value={selectedEntity.animation?.spriteRows ?? 1}
+                                onChange={(val) =>
+                                  updateEntity(selectedEntity.id, {
+                                    animation: {
+                                      preset: selectedEntity.animation?.preset ?? 'none',
+                                      speed: selectedEntity.animation?.speed ?? 3,
+                                      amplitude: selectedEntity.animation?.amplitude ?? 8,
+                                      ...selectedEntity.animation,
+                                      spriteCols: selectedEntity.animation?.spriteCols ?? 1,
+                                      spriteRows: Math.max(1, Math.round(val)),
+                                      fps: selectedEntity.animation?.fps ?? 8,
+                                    },
+                                  })
+                                }
+                                className="w-full px-2 py-1 rounded border border-slate-700 bg-[#0B0E14] text-slate-100 text-center font-mono"
+                              />
+                            </div>
+                            <div className="space-y-1">
+                              <label className="text-slate-400">FPS</label>
+                              <NumericInput
+                                min={1}
+                                max={60}
+                                value={selectedEntity.animation?.fps ?? 8}
+                                onChange={(val) =>
+                                  updateEntity(selectedEntity.id, {
+                                    animation: {
+                                      preset: selectedEntity.animation?.preset ?? 'none',
+                                      speed: selectedEntity.animation?.speed ?? 3,
+                                      amplitude: selectedEntity.animation?.amplitude ?? 8,
+                                      ...selectedEntity.animation,
+                                      spriteCols: selectedEntity.animation?.spriteCols ?? 1,
+                                      spriteRows: selectedEntity.animation?.spriteRows ?? 1,
+                                      fps: Math.max(1, Math.round(val)),
+                                    },
+                                  })
+                                }
+                                className="w-full px-2 py-1 rounded border border-slate-700 bg-[#0B0E14] text-slate-100 text-center font-mono"
+                              />
+                            </div>
                           </div>
-                          <div className="space-y-1">
-                            <label className="text-slate-400">سطر اسپرایت</label>
-                            <NumericInput
-                              min={1}
-                              max={32}
-                              value={selectedEntity.animation?.spriteRows ?? 1}
-                              onChange={(val) =>
-                                updateEntity(selectedEntity.id, {
-                                  animation: {
-                                    preset: selectedEntity.animation?.preset ?? 'none',
-                                    speed: selectedEntity.animation?.speed ?? 3,
-                                    amplitude: selectedEntity.animation?.amplitude ?? 8,
-                                    spriteCols: selectedEntity.animation?.spriteCols ?? 1,
-                                    spriteRows: Math.max(1, Math.round(val)),
-                                    fps: selectedEntity.animation?.fps ?? 8,
+                          {(selectedEntity.animation?.spriteRows ?? 1) > 1 && (
+                            <div className="grid grid-cols-3 gap-1.5 pt-1 tabular-nums">
+                              <div className="space-y-1">
+                                <label className="text-[10px] text-slate-400">سطر ایستاده</label>
+                                <NumericInput
+                                  min={0}
+                                  max={31}
+                                  value={selectedEntity.animation?.idleRow ?? 0}
+                                  onChange={(val) =>
+                                    updateEntity(selectedEntity.id, {
+                                      animation: {
+                                        preset: selectedEntity.animation?.preset ?? 'none',
+                                        speed: selectedEntity.animation?.speed ?? 3,
+                                        amplitude: selectedEntity.animation?.amplitude ?? 8,
+                                        spriteCols: selectedEntity.animation?.spriteCols ?? 1,
+                                        spriteRows: selectedEntity.animation?.spriteRows ?? 1,
+                                        fps: selectedEntity.animation?.fps ?? 8,
+                                        ...selectedEntity.animation,
+                                        idleRow: Math.max(0, Math.round(val)),
+                                      },
+                                    })
+                                  }
+                                  className="w-full px-1 py-0.5 rounded border border-slate-700 bg-[#0B0E14] text-slate-100 text-center font-mono"
+                                />
+                              </div>
+                              <div className="space-y-1">
+                                <label className="text-[10px] text-slate-400">سطر حرکت</label>
+                                <NumericInput
+                                  min={0}
+                                  max={31}
+                                  value={selectedEntity.animation?.walkRow ?? 1}
+                                  onChange={(val) =>
+                                    updateEntity(selectedEntity.id, {
+                                      animation: {
+                                        preset: selectedEntity.animation?.preset ?? 'none',
+                                        speed: selectedEntity.animation?.speed ?? 3,
+                                        amplitude: selectedEntity.animation?.amplitude ?? 8,
+                                        spriteCols: selectedEntity.animation?.spriteCols ?? 1,
+                                        spriteRows: selectedEntity.animation?.spriteRows ?? 1,
+                                        fps: selectedEntity.animation?.fps ?? 8,
+                                        ...selectedEntity.animation,
+                                        walkRow: Math.max(0, Math.round(val)),
+                                      },
+                                    })
+                                  }
+                                  className="w-full px-1 py-0.5 rounded border border-slate-700 bg-[#0B0E14] text-slate-100 text-center font-mono"
+                                />
+                              </div>
+                              <div className="space-y-1">
+                                <label className="text-[10px] text-slate-400">سطر پرش</label>
+                                <NumericInput
+                                  min={0}
+                                  max={31}
+                                  value={selectedEntity.animation?.jumpRow ?? 0}
+                                  onChange={(val) =>
+                                    updateEntity(selectedEntity.id, {
+                                      animation: {
+                                        preset: selectedEntity.animation?.preset ?? 'none',
+                                        speed: selectedEntity.animation?.speed ?? 3,
+                                        amplitude: selectedEntity.animation?.amplitude ?? 8,
+                                        spriteCols: selectedEntity.animation?.spriteCols ?? 1,
+                                        spriteRows: selectedEntity.animation?.spriteRows ?? 1,
+                                        fps: selectedEntity.animation?.fps ?? 8,
+                                        ...selectedEntity.animation,
+                                        jumpRow: Math.max(0, Math.round(val)),
+                                      },
+                                    })
+                                  }
+                                  className="w-full px-1 py-0.5 rounded border border-slate-700 bg-[#0B0E14] text-slate-100 text-center font-mono"
+                                />
+                              </div>
+                            </div>
+                          )}
+                        </>
+                      )}
+
+                      {selectedEntity.kind === 'model3d-asset' &&
+                        (() => {
+                          const linkedAsset = project.assets.find(
+                            (a) => a.id === selectedEntity.assetId
+                          );
+                          const clipNames = linkedAsset?.modelMeta?.animationNames || [];
+                          if (clipNames.length === 0) return null;
+                          const baseAnim = selectedEntity.animation || {
+                            preset: 'none' as AnimationPreset,
+                            speed: 1,
+                            amplitude: 0,
+                            spriteCols: 1,
+                            spriteRows: 1,
+                            fps: 8,
+                          };
+                          return (
+                            <div className="space-y-1.5 pt-2 border-t border-slate-800/70">
+                              <div className="text-[11px] font-semibold text-sky-300">
+                                اتصال کلیپ‌های اسکلتی مدل ({clipNames.length} کلیپ):
+                              </div>
+                              <div className="grid grid-cols-3 gap-1.5">
+                                <div className="space-y-0.5">
+                                  <label className="text-[10px] text-slate-400">ایستاده (Idle)</label>
+                                  <select
+                                    value={baseAnim.idleClip || ''}
+                                    onChange={(e) =>
+                                      updateEntity(selectedEntity.id, {
+                                        animation: {
+                                          ...baseAnim,
+                                          idleClip: e.target.value || undefined,
+                                        },
+                                      })
+                                    }
+                                    className="w-full px-1 py-1 rounded border border-slate-700 bg-[#0B0E14] text-[10px] text-slate-100"
+                                  >
+                                    <option value="">خودکار</option>
+                                    {clipNames.map((cn) => (
+                                      <option key={cn} value={cn}>
+                                        {cn}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </div>
+                                <div className="space-y-0.5">
+                                  <label className="text-[10px] text-slate-400">حرکت (Walk)</label>
+                                  <select
+                                    value={baseAnim.walkClip || ''}
+                                    onChange={(e) =>
+                                      updateEntity(selectedEntity.id, {
+                                        animation: {
+                                          ...baseAnim,
+                                          walkClip: e.target.value || undefined,
+                                        },
+                                      })
+                                    }
+                                    className="w-full px-1 py-1 rounded border border-slate-700 bg-[#0B0E14] text-[10px] text-slate-100"
+                                  >
+                                    <option value="">خودکار</option>
+                                    {clipNames.map((cn) => (
+                                      <option key={cn} value={cn}>
+                                        {cn}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </div>
+                                <div className="space-y-0.5">
+                                  <label className="text-[10px] text-slate-400">پرش (Jump)</label>
+                                  <select
+                                    value={baseAnim.jumpClip || ''}
+                                    onChange={(e) =>
+                                      updateEntity(selectedEntity.id, {
+                                        animation: {
+                                          ...baseAnim,
+                                          jumpClip: e.target.value || undefined,
+                                        },
+                                      })
+                                    }
+                                    className="w-full px-1 py-1 rounded border border-slate-700 bg-[#0B0E14] text-[10px] text-slate-100"
+                                  >
+                                    <option value="">خودکار</option>
+                                    {clipNames.map((cn) => (
+                                      <option key={cn} value={cn}>
+                                        {cn}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })()}
+                    </div>
+                  )}
+
+                  {/* Per-Entity Declarative Behavior System */}
+                  {selectedEntity.kind !== 'hud-text' && selectedEntity.kind !== 'text-box' && (
+                    <div className="pt-3 border-t border-slate-800 space-y-2.5">
+                      <h4 className="font-bold text-amber-300">رفتار خودکار شیء (Behavior)</h4>
+                      <select
+                        value={selectedEntity.behavior?.mode || 'none'}
+                        onChange={(e) => {
+                          const mode = e.target.value as EntityBehaviorMode;
+                          updateEntity(selectedEntity.id, {
+                            behavior:
+                              mode === 'none'
+                                ? undefined
+                                : {
+                                    speed:
+                                      selectedEntity.behavior?.speed ??
+                                      (project.engineMode === '3d' ? 3 : 110),
+                                    range:
+                                      selectedEntity.behavior?.range ??
+                                      (project.engineMode === '3d' ? 7 : 180),
+                                    intervalSeconds:
+                                      selectedEntity.behavior?.intervalSeconds ?? 2,
+                                    amount: selectedEntity.behavior?.amount ?? 15,
+                                    ...selectedEntity.behavior,
+                                    mode,
                                   },
-                                })
-                              }
-                              className="w-full px-2 py-1 rounded border border-slate-700 bg-[#0B0E14] text-slate-100 text-center font-mono"
-                            />
-                          </div>
-                          <div className="space-y-1">
-                            <label className="text-slate-400">FPS</label>
-                            <NumericInput
-                              min={1}
-                              max={60}
-                              value={selectedEntity.animation?.fps ?? 8}
-                              onChange={(val) =>
-                                updateEntity(selectedEntity.id, {
-                                  animation: {
-                                    preset: selectedEntity.animation?.preset ?? 'none',
-                                    speed: selectedEntity.animation?.speed ?? 3,
-                                    amplitude: selectedEntity.animation?.amplitude ?? 8,
-                                    spriteCols: selectedEntity.animation?.spriteCols ?? 1,
-                                    spriteRows: selectedEntity.animation?.spriteRows ?? 1,
-                                    fps: Math.max(1, Math.round(val)),
-                                  },
-                                })
-                              }
-                              className="w-full px-2 py-1 rounded border border-slate-700 bg-[#0B0E14] text-slate-100 text-center font-mono"
-                            />
-                          </div>
+                          });
+                        }}
+                        className="w-full px-2 py-1.5 rounded-lg border border-slate-700 bg-[#0B0E14] text-slate-100"
+                      >
+                        <option value="none">بدون رفتار خودکار (کنترل با قوانین)</option>
+                        <option value="patrol">گشت‌زنی رفت و برگشت (Patrol)</option>
+                        <option value="moving-platform">سکوی متحرک با حمل بازیکن</option>
+                        <option value="chase">تعقیب هوشمند بازیکن / هدف</option>
+                        <option value="flee">فرار از بازیکن</option>
+                        <option value="orbit">چرخش مداری به دور هدف</option>
+                        <option value="turret-shoot">برجک تیرانداز دوره‌ای</option>
+                        <option value="collectible-bob">جایزه / سکه شناور قابل جمع‌آوری</option>
+                        <option value="hazard-damage">تله / آسیب‌زننده در برخورد</option>
+                        <option value="bounce-pad">سکوی جهش (Bounce Pad)</option>
+                        <option value="checkpoint">نقطه ذخیره بازگشت (Checkpoint)</option>
+                        <option value="scene-portal">دروازه انتقال به مرحله دیگر (Portal)</option>
+                      </select>
+
+                      {selectedEntity.behavior && selectedEntity.behavior.mode !== 'none' && (
+                        <div className="grid grid-cols-2 gap-2 tabular-nums">
+                          {['patrol', 'moving-platform', 'chase', 'flee', 'orbit', 'turret-shoot'].includes(
+                            selectedEntity.behavior.mode
+                          ) && (
+                            <div className="space-y-1">
+                              <label className="text-[11px] text-slate-400">سرعت</label>
+                              <NumericInput
+                                step={project.engineMode === '3d' ? 0.5 : 10}
+                                value={
+                                  selectedEntity.behavior.speed ??
+                                  (project.engineMode === '3d' ? 3 : 110)
+                                }
+                                onChange={(v) =>
+                                  updateEntity(selectedEntity.id, {
+                                    behavior: { ...selectedEntity.behavior!, speed: v },
+                                  })
+                                }
+                                className="w-full px-2 py-1 rounded border border-slate-700 bg-[#0B0E14] text-slate-100 text-center font-mono"
+                              />
+                            </div>
+                          )}
+                          {['patrol', 'moving-platform', 'chase', 'flee', 'orbit'].includes(
+                            selectedEntity.behavior.mode
+                          ) && (
+                            <div className="space-y-1">
+                              <label className="text-[11px] text-slate-400">شعاع / محدوده</label>
+                              <NumericInput
+                                step={project.engineMode === '3d' ? 1 : 20}
+                                value={
+                                  selectedEntity.behavior.range ??
+                                  (project.engineMode === '3d' ? 7 : 180)
+                                }
+                                onChange={(v) =>
+                                  updateEntity(selectedEntity.id, {
+                                    behavior: { ...selectedEntity.behavior!, range: v },
+                                  })
+                                }
+                                className="w-full px-2 py-1 rounded border border-slate-700 bg-[#0B0E14] text-slate-100 text-center font-mono"
+                              />
+                            </div>
+                          )}
+                          {selectedEntity.behavior.mode === 'turret-shoot' && (
+                            <div className="space-y-1">
+                              <label className="text-[11px] text-slate-400">فاصله شلیک (ثانیه)</label>
+                              <NumericInput
+                                step={0.5}
+                                min={0.4}
+                                value={selectedEntity.behavior.intervalSeconds ?? 2}
+                                onChange={(v) =>
+                                  updateEntity(selectedEntity.id, {
+                                    behavior: { ...selectedEntity.behavior!, intervalSeconds: v },
+                                  })
+                                }
+                                className="w-full px-2 py-1 rounded border border-slate-700 bg-[#0B0E14] text-slate-100 text-center font-mono"
+                              />
+                            </div>
+                          )}
+                          {['collectible-bob', 'hazard-damage', 'bounce-pad'].includes(
+                            selectedEntity.behavior.mode
+                          ) && (
+                            <div className="space-y-1 col-span-2">
+                              <label className="text-[11px] text-slate-400">مقدار (امتیاز / آسیب / قدرت پرش)</label>
+                              <NumericInput
+                                value={selectedEntity.behavior.amount ?? 15}
+                                onChange={(v) =>
+                                  updateEntity(selectedEntity.id, {
+                                    behavior: { ...selectedEntity.behavior!, amount: v },
+                                  })
+                                }
+                                className="w-full px-2 py-1 rounded border border-slate-700 bg-[#0B0E14] text-slate-100 text-center font-mono"
+                              />
+                            </div>
+                          )}
+                          {selectedEntity.behavior.mode === 'scene-portal' && (
+                            <div className="space-y-1 col-span-2">
+                              <label className="text-[11px] text-slate-400">انتقال به صحنه:</label>
+                              <select
+                                value={selectedEntity.behavior.nextSceneId || ''}
+                                onChange={(e) =>
+                                  updateEntity(selectedEntity.id, {
+                                    behavior: {
+                                      ...selectedEntity.behavior!,
+                                      nextSceneId: e.target.value,
+                                    },
+                                  })
+                                }
+                                className="w-full px-2 py-1 rounded border border-slate-700 bg-[#0B0E14] text-slate-100"
+                              >
+                                <option value="">مرحله بعدی به ترتیب</option>
+                                {project.scenes.map((sc) => (
+                                  <option key={sc.id} value={sc.id}>
+                                    {sc.name}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>
@@ -2984,6 +3433,149 @@ export const SceneEditorWorkspace: React.FC<SceneEditorWorkspaceProps> = ({
                           }
                           className="w-full accent-amber-500"
                         />
+                      </div>
+
+                      {/* General Collision System Controls */}
+                      <div className="pt-2 border-t border-slate-800/80 space-y-2">
+                        <div className="text-[11px] font-bold text-emerald-300">
+                          سیستم برخورد عمومی (Collision)
+                        </div>
+                        <div className="grid grid-cols-2 gap-2">
+                          <div className="space-y-1">
+                            <label className="text-[10px] text-slate-400">نوع پاسخ برخورد</label>
+                            <select
+                              value={
+                                selectedEntity.collisionConfig?.response ||
+                                getDefaultCollisionConfig(selectedEntity.role).response
+                              }
+                              onChange={(e) =>
+                                updateEntity(selectedEntity.id, {
+                                  collisionConfig: {
+                                    ...getDefaultCollisionConfig(selectedEntity.role),
+                                    ...selectedEntity.collisionConfig,
+                                    response: e.target.value as EntityCollisionConfig['response'],
+                                  },
+                                })
+                              }
+                              className="w-full px-1.5 py-1 rounded border border-slate-700 bg-[#0B0E14] text-[11px] text-slate-100"
+                            >
+                              <option value="solid">جامد / مانع (Solid)</option>
+                              <option value="trigger">ماشه رویداد (Trigger)</option>
+                              <option value="none">بدون برخورد</option>
+                            </select>
+                          </div>
+                          <div className="space-y-1">
+                            <label className="text-[10px] text-slate-400">فیلتر برخورد با نقش</label>
+                            <select
+                              value={selectedEntity.collisionConfig?.filterRole || 'player'}
+                              onChange={(e) =>
+                                updateEntity(selectedEntity.id, {
+                                  collisionConfig: {
+                                    ...getDefaultCollisionConfig(selectedEntity.role),
+                                    ...selectedEntity.collisionConfig,
+                                    filterRole: e.target.value as EntityRole | 'any',
+                                  },
+                                })
+                              }
+                              className="w-full px-1.5 py-1 rounded border border-slate-700 bg-[#0B0E14] text-[11px] text-slate-100"
+                            >
+                              <option value="player">فقط بازیکن</option>
+                              <option value="any">همه اشیا</option>
+                              <option value="enemy">دشمن</option>
+                              <option value="collectible">سکه / جایزه</option>
+                            </select>
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-2">
+                          <div className="space-y-1">
+                            <label className="text-[10px] text-slate-400">عملکرد هنگام برخورد</label>
+                            <select
+                              value={selectedEntity.collisionConfig?.onCollideAction || 'none'}
+                              onChange={(e) =>
+                                updateEntity(selectedEntity.id, {
+                                  collisionConfig: {
+                                    ...getDefaultCollisionConfig(selectedEntity.role),
+                                    ...selectedEntity.collisionConfig,
+                                    onCollideAction: e.target
+                                      .value as EntityCollisionConfig['onCollideAction'],
+                                  },
+                                })
+                              }
+                              className="w-full px-1.5 py-1 rounded border border-slate-700 bg-[#0B0E14] text-[11px] text-slate-100"
+                            >
+                              <option value="none">هیچ‌کدام</option>
+                              <option value="collect">جمع‌آوری (+امتیاز و حذف)</option>
+                              <option value="damage">آسیب به هدف (-جان)</option>
+                              <option value="bounce">پرتاب به بالا (Bounce)</option>
+                              <option value="destroy-other">حذف شیء برخوردکننده</option>
+                              <option value="destroy-self">حذف این شیء</option>
+                              <option value="next-scene">انتقال به مرحله بعد</option>
+                              <option value="go-to-scene">رفتن به صحنه مشخص</option>
+                            </select>
+                          </div>
+                          <div className="space-y-1">
+                            <label className="text-[10px] text-slate-400">مقدار / عدد عمل</label>
+                            <NumericInput
+                              value={selectedEntity.collisionConfig?.actionAmount ?? 10}
+                              onChange={(v) =>
+                                updateEntity(selectedEntity.id, {
+                                  collisionConfig: {
+                                    ...getDefaultCollisionConfig(selectedEntity.role),
+                                    ...selectedEntity.collisionConfig,
+                                    actionAmount: v,
+                                  },
+                                })
+                              }
+                              className="w-full px-2 py-1 rounded border border-slate-700 bg-[#0B0E14] text-slate-100 text-center font-mono"
+                            />
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Quick Logic Rule Binding for Selected Object */}
+                      <div className="pt-2 border-t border-slate-800/80 space-y-1.5">
+                        <div className="text-[11px] font-bold text-sky-300">
+                          اتصال منطق سریع به «{selectedEntity.name}»:
+                        </div>
+                        <div className="flex flex-wrap gap-1">
+                          {[
+                            {
+                              label: 'حرکت WASD / جهت',
+                              rule:
+                                project.engineMode === '3d'
+                                  ? `کلید راست: ${selectedEntity.name} حرکت راست سرعت 7\nکلید چپ: ${selectedEntity.name} حرکت چپ سرعت 7\nکلید بالا: ${selectedEntity.name} حرکت جلو سرعت 7\nکلید پایین: ${selectedEntity.name} حرکت عقب سرعت 7\nکلید فاصله: ${selectedEntity.name} پرش قدرت 10`
+                                  : `کلید راست: ${selectedEntity.name} حرکت راست سرعت 270\nکلید چپ: ${selectedEntity.name} حرکت چپ سرعت 270\nکلید فاصله: ${selectedEntity.name} پرش قدرت 550`,
+                            },
+                            {
+                              label: 'جمع‌آوری +10',
+                              rule: `برخورد ${
+                                project.entities.find((e) => e.role === 'player')?.name || 'بازیکن'
+                              } با ${selectedEntity.name}: امتیاز +10 | افکت جرقه | حذف ${selectedEntity.name} | صدا coin`,
+                            },
+                          ].map((pr) => (
+                            <button
+                              key={pr.label}
+                              type="button"
+                              onClick={() =>
+                                onUpdateProject((prev) => {
+                                  const nextText = prev.rulesText.trim()
+                                    ? `${prev.rulesText.trim()}\n${pr.rule}`
+                                    : pr.rule;
+                                  return {
+                                    ...prev,
+                                    rulesText: nextText,
+                                    rules: parsePersianRules(nextText, prev.entities).rules,
+                                    updatedAt: Date.now(),
+                                  };
+                                })
+                              }
+                              className="px-2 py-1 rounded bg-[#0B0E14] border border-slate-700 text-[10px] text-amber-300 hover:border-amber-400"
+                            >
+                              + {pr.label}
+                            </button>
+                          ))}
+                        </div>
                       </div>
                     </div>
                   )}

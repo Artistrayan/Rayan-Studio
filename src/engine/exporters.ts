@@ -1,5 +1,16 @@
 import JSZip from 'jszip';
 import type { RayanProject } from '../types/studio';
+import { arrayBufferToDataUrl, retrieveBinaryModel } from '../storage/projectDb';
+import { getMimeTypeForAsset } from './assetManager';
+
+function escapeHtmlText(raw: string): string {
+  return String(raw || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 function safeSlug(name: string): string {
   const cleaned = name
@@ -23,6 +34,20 @@ function triggerDownload(blob: Blob, filename: string) {
 
 async function fetchToDataUrl(url: string): Promise<string> {
   if (!url || url.startsWith('data:')) return url;
+  if (url.startsWith('idb://')) {
+    const assetId = url.slice('idb://'.length);
+    try {
+      const retrieved = await retrieveBinaryModel(assetId);
+      if (retrieved?.buffer) {
+        return arrayBufferToDataUrl(
+          retrieved.buffer,
+          getMimeTypeForAsset(retrieved.record.kind, retrieved.record.format)
+        );
+      }
+    } catch {
+      return url;
+    }
+  }
   try {
     const resp = await fetch(url);
     const blob = await resp.blob();
@@ -46,6 +71,21 @@ async function resolveProjectForOfflineExport(project: RayanProject): Promise<Ra
       sc.environment.backgroundImageUrl = await fetchToDataUrl(sc.environment.backgroundImageUrl);
     }
   }
+  for (const asset of cloned.assets || []) {
+    if ((asset.kind === 'image' || asset.kind === 'audio') && (!asset.dataUrl || asset.dataUrl.startsWith('idb://'))) {
+      try {
+        const retrieved = await retrieveBinaryModel(asset.id);
+        if (retrieved?.buffer) {
+          asset.dataUrl = arrayBufferToDataUrl(
+            retrieved.buffer,
+            getMimeTypeForAsset(asset.kind, asset.format)
+          );
+        }
+      } catch {
+        // leave pointer as fallback
+      }
+    }
+  }
   return cloned;
 }
 
@@ -63,7 +103,7 @@ export async function buildStandaloneGameHtml(project: RayanProject): Promise<st
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>${resolved.name}</title>
+  <title>${escapeHtmlText(resolved.name)}</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; -webkit-tap-highlight-color: transparent; }
     html, body { width: 100%; height: 100%; background: #07090e; color: #f8fafc; font-family: system-ui, -apple-system, sans-serif; overflow: hidden; display: flex; align-items: center; justify-content: center; }
@@ -530,7 +570,6 @@ export async function buildStandaloneGameHtml(project: RayanProject): Promise<st
       }
     }
 
-    const customJsHandles = [];
     const customApi = {
       get score() { return state.score; },
       setScore: v => { state.score = v; },
@@ -548,19 +587,102 @@ export async function buildStandaloneGameHtml(project: RayanProject): Promise<st
       spawnParticles: (x, y, pr) => spawnParticles(x, y, pr || 'sparkle', 18),
       log: m => console.log('[Rayan]', m)
     };
-    (PROJECT.codeFiles || []).filter(cf => cf.enabledInRuntime && cf.language === 'javascript').forEach(cf => {
-      try {
-        const fn = new Function('api', '"use strict";\\n' + cf.content + '\\nreturn { onStart: typeof onStart === "function" ? onStart : null, onUpdate: typeof onUpdate === "function" ? onUpdate : null };');
-        const h = fn(customApi);
-        if (h) { customJsHandles.push(h); if (h.onStart) h.onStart(customApi); }
-      } catch (err) { console.error(cf.name, err); }
-    });
+
+    const workerSessions = [];
+    const jsFiles = (PROJECT.codeFiles || []).filter(cf => cf.enabledInRuntime && cf.language === 'javascript');
+    if (jsFiles.length > 0 && typeof Worker !== 'undefined') {
+      const workerCode = \`
+        self.onmessage = function(ev) {
+          const msg = ev.data || {};
+          if (msg.type === 'INIT') {
+            self.__code = msg.code || '';
+            try {
+              const run = new Function('api', '"use strict";\\\\n' + self.__code + '\\\\nreturn { onStart: typeof onStart === "function" ? onStart : null, onUpdate: typeof onUpdate === "function" ? onUpdate : null };');
+              const cmds = [];
+              const api = {
+                get score() { return msg.snapshot.score; },
+                get health() { return msg.snapshot.health; },
+                get vars() { return msg.snapshot.custom; },
+                get elapsed() { return msg.snapshot.elapsed; },
+                setScore: v => cmds.push(['setScore', v]),
+                addScore: d => cmds.push(['addScore', d]),
+                setHealth: v => cmds.push(['setHealth', v]),
+                setVar: (n, v) => cmds.push(['setVar', n, v]),
+                findEntity: name => (msg.snapshot.entities || []).find(e => e.name === name) || null,
+                moveEntity: (name, vx, vy, vz) => cmds.push(['moveEntity', name, vx, vy, vz]),
+                setEntityPosition: (name, x, y, z) => cmds.push(['setEntityPosition', name, x, y, z]),
+                showMessage: m => cmds.push(['showMessage', String(m)]),
+                playSound: n => cmds.push(['playSound', n]),
+                spawnParticles: (x, y, p) => cmds.push(['spawnParticles', x, y, p]),
+                log: m => cmds.push(['log', String(m)])
+              };
+              self.__hooks = run(api);
+              self.__api = api;
+              self.__cmds = cmds;
+              if (self.__hooks && self.__hooks.onStart) self.__hooks.onStart(api);
+              self.postMessage({ type: 'CMDS', cmds: cmds.splice(0) });
+            } catch (err) {
+              self.postMessage({ type: 'ERR', error: String(err) });
+            }
+          } else if (msg.type === 'STEP' && self.__hooks && self.__hooks.onUpdate) {
+            try {
+              const cmds = [];
+              const api = Object.assign({}, self.__api, {
+                score: msg.snapshot.score,
+                health: msg.snapshot.health,
+                vars: msg.snapshot.custom,
+                elapsed: msg.snapshot.elapsed,
+                findEntity: name => (msg.snapshot.entities || []).find(e => e.name === name) || null,
+                setScore: v => cmds.push(['setScore', v]),
+                addScore: d => cmds.push(['addScore', d]),
+                setHealth: v => cmds.push(['setHealth', v]),
+                setVar: (n, v) => cmds.push(['setVar', n, v]),
+                moveEntity: (name, vx, vy, vz) => cmds.push(['moveEntity', name, vx, vy, vz]),
+                setEntityPosition: (name, x, y, z) => cmds.push(['setEntityPosition', name, x, y, z]),
+                showMessage: m => cmds.push(['showMessage', String(m)]),
+                playSound: n => cmds.push(['playSound', n]),
+                spawnParticles: (x, y, p) => cmds.push(['spawnParticles', x, y, p]),
+                log: m => cmds.push(['log', String(m)])
+              });
+              self.__hooks.onUpdate(api, msg.dt);
+              if (cmds.length) self.postMessage({ type: 'CMDS', cmds });
+            } catch {}
+          }
+        };
+      \`;
+      const workerBlobUrl = URL.createObjectURL(new Blob([workerCode], { type: 'application/javascript' }));
+      function applyWorkerCmds(cmds) {
+        (cmds || []).forEach(c => {
+          const fn = customApi[c[0]];
+          if (typeof fn === 'function') fn.apply(customApi, c.slice(1));
+        });
+      }
+      function makeSnapshot() {
+        return {
+          score: state.score,
+          health: state.health,
+          custom: state.custom,
+          elapsed: state.elapsed,
+          entities: state.bodies.filter(b => b.alive).map(b => ({ name: b.name, x: b.x, y: b.y, z: b.z, vx: b.vx, vy: b.vy }))
+        };
+      }
+      jsFiles.forEach(cf => {
+        try {
+          const w = new Worker(workerBlobUrl);
+          w.onmessage = ev => { if (ev.data && ev.data.type === 'CMDS') applyWorkerCmds(ev.data.cmds); };
+          w.postMessage({ type: 'INIT', code: cf.content, snapshot: makeSnapshot() });
+          workerSessions.push({ worker: w, busy: false, makeSnapshot });
+        } catch (err) { console.error(cf.name, err); }
+      });
+    }
 
     let last = performance.now();
     function loop(now) {
       const dt = Math.min((now - last) / 1000, 0.04); last = now;
       state.elapsed += dt;
-      customJsHandles.forEach(h => { try { if (h.onUpdate) h.onUpdate(customApi, dt); } catch {} });
+      workerSessions.forEach(ws => {
+        try { ws.worker.postMessage({ type: 'STEP', dt, snapshot: ws.makeSnapshot() }); } catch {}
+      });
       const sc = state.scene;
       const worldW = Math.max(W, (sc.camera && sc.camera.worldWidth) || W);
       const worldH = Math.max(H, (sc.camera && sc.camera.worldHeight) || H);
@@ -846,19 +968,51 @@ echo "AAB (Google Play / Bazaar / Myket): android/app/build/outputs/bundle/relea
   );
   zip.file(
     'STORE-RELEASE-GUIDE.md',
-    `# راهنمای انتشار اندروید (${project.name})
+    `# راهنمای ساخت APK / AAB اندروید (${project.name})
 
+این بسته شامل سورس پروژه استاندارد **Capacitor + Gradle** برای اندروید است (نه فایل باینری پیش‌کامپایل‌شده).
+
+## روش ۱: ساخت خودکار با GitHub Actions
+فایل \`.github/workflows/android-apk.yml\` درون این بسته قرار دارد؛ با آپلود در مخزن GitHub، فایل APK دیباگ به‌صورت خودکار ساخته و در Artifact منتشر می‌شود.
+
+## روش ۲: ساخت محلی با Android Studio / JDK 17
 1. پیش‌نیازها: Node.js و Android Studio / JDK 17.
 2. در پوشه پروژه دستور \`npm install\` و سپس \`npx cap add android && npx cap sync android\` را اجرا کنید.
-3. برای تست روی گوشی: \`npx cap open android\` و دکمه Run را بزنید.
-4. برای انتشار در کافه‌بازار، مایکت یا گوگل‌پلی:
-   - در Android Studio منوی **Build -> Generate Signed Bundle / APK** را انتخاب کنید.
-   - فایل \`app-release.aab\` یا \`app-release.apk\` خروجی کاملاً آفلاین و آماده انتشار است.
+3. برای تست روی گوشی: \`npx cap open android\` و دکمه Run را بزنید یا اسکریپت \`./build-apk.sh\` را اجرا کنید.
+`
+  );
+  zip.folder('.github')?.folder('workflows')?.file(
+    'android-apk.yml',
+    `name: Build Android APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - run: npm install
+      - run: npx cap add android
+      - run: npx cap sync android
+      - run: cd android && chmod +x gradlew && ./gradlew assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${slug}-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
 `
   );
 
   const blob = await zip.generateAsync({ type: 'blob' });
-  triggerDownload(blob, `${slug}-android-store.zip`);
+  triggerDownload(blob, `${slug}-android-capacitor-source.zip`);
 }
 
 export async function exportWindowsProjectZip(project: RayanProject) {

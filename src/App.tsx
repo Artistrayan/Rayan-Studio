@@ -5,6 +5,7 @@ import {
   createStarter3DProject,
   deleteAssetFromDb,
   deleteProjectFromDb,
+  linkAssetToScene,
   listSavedProjects,
   normalizeProject,
   saveProjectToDb,
@@ -20,6 +21,11 @@ import { CodeIdePanel } from './components/CodeIdePanel';
 import { Studio3DView } from './components/Studio3DView';
 import { VisualUIBuilder } from './components/VisualUIBuilder';
 import { importZipPackage } from './engine/zipHandler';
+import { ShieldAlert } from 'lucide-react';
+import {
+  permissionManager,
+  type PermissionRequestPrompt,
+} from './security/permissionManager';
 
 type StudioTab =
   | 'editor'
@@ -55,10 +61,20 @@ export default function App() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [savingState, setSavingState] = useState<'idle' | 'saving' | 'saved'>('idle');
   const [loading, setLoading] = useState(true);
+  const [pendingConsent, setPendingConsent] = useState<PermissionRequestPrompt | null>(null);
 
   const pastRef = useRef<RayanProject[]>([]);
   const futureRef = useRef<RayanProject[]>([]);
   const [historyMeta, setHistoryMeta] = useState({ canUndo: false, canRedo: false });
+
+  useEffect(() => {
+    permissionManager.setPromptHandler((prompt) => {
+      setPendingConsent(prompt);
+    });
+    return () => {
+      permissionManager.setPromptHandler(null);
+    };
+  }, []);
 
   const syncHistoryMeta = () => {
     setHistoryMeta({
@@ -287,6 +303,9 @@ export default function App() {
     const now = Date.now();
     const id = `ent_${now}_${Math.random().toString(36).slice(2, 5)}`;
 
+    const nodeOrEntityId = is3D ? `node_${id}` : id;
+    void linkAssetToScene(asset.id, activeProject.activeSceneId, nodeOrEntityId).catch(() => {});
+
     handleUpdateActiveProject(
       (prev) => {
         const nextEntities = [
@@ -344,11 +363,24 @@ export default function App() {
             ]
           : prev.studio3dNodes;
 
+        const nextAssets = prev.assets.map((a) =>
+          a.id === asset.id
+            ? {
+                ...a,
+                linkedSceneIds: Array.from(new Set([...(a.linkedSceneIds || []), prev.activeSceneId])),
+                linkedSceneNodeIds: Array.from(
+                  new Set([...(a.linkedSceneNodeIds || []), nodeOrEntityId])
+                ),
+              }
+            : a
+        );
+
         return {
           ...prev,
           engineMode: is3D ? '3d' : prev.engineMode,
           entities: nextEntities,
           studio3dNodes: nextStudio3DNodes,
+          assets: nextAssets,
           updatedAt: now,
         };
       },
@@ -535,6 +567,30 @@ export default function App() {
               true
             );
           }}
+          onUpdateAsset={(updatedAsset) =>
+            handleUpdateActiveProject(
+              (prev) => ({
+                ...prev,
+                assets: prev.assets.map((a) => (a.id === updatedAsset.id ? updatedAsset : a)),
+                updatedAt: Date.now(),
+              }),
+              true,
+              true
+            )
+          }
+          onRenameAsset={(id, nextName) =>
+            handleUpdateActiveProject(
+              (prev) => ({
+                ...prev,
+                assets: prev.assets.map((a) =>
+                  a.id === id ? { ...a, name: nextName.trim() || a.name } : a
+                ),
+                updatedAt: Date.now(),
+              }),
+              true,
+              true
+            )
+          }
           onSetBackgroundImage={(url) =>
             handleUpdateActiveProject((prev) => ({
               ...prev,
@@ -574,6 +630,54 @@ export default function App() {
       )}
 
       {activeTab === 'export' && <ExportView project={activeProject} />}
+
+      {/* Global Zero-Trust Permission Consent Modal */}
+      {pendingConsent && (
+        <div className="fixed inset-0 z-[100] bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="w-full max-w-md rounded-2xl border border-amber-500/40 bg-[#0F131C] p-5 shadow-2xl space-y-4">
+            <div className="flex items-start gap-3">
+              <div className="p-2.5 rounded-xl bg-amber-500/15 text-amber-400 shrink-0">
+                <ShieldAlert className="w-5 h-5" />
+              </div>
+              <div className="space-y-1">
+                <h3 className="text-sm font-bold text-slate-100">
+                  درخواست مجوز امنیتی: {pendingConsent.title}
+                </h3>
+                <p className="text-xs text-slate-400 leading-relaxed">
+                  {pendingConsent.description}
+                </p>
+                <div className="text-[11px] font-mono text-amber-300/80 pt-1">
+                  محدوده: {pendingConsent.scope}
+                </div>
+              </div>
+            </div>
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-800">
+              <button
+                type="button"
+                onClick={() => {
+                  const p = pendingConsent;
+                  setPendingConsent(null);
+                  p.resolve(false);
+                }}
+                className="px-3.5 py-2 rounded-lg border border-slate-700 bg-slate-800 text-slate-300 text-xs font-semibold hover:bg-slate-700 cursor-pointer"
+              >
+                رد درخواست (Deny)
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const p = pendingConsent;
+                  setPendingConsent(null);
+                  p.resolve(true);
+                }}
+                className="px-4 py-2 rounded-lg bg-emerald-500 text-slate-950 text-xs font-bold hover:bg-emerald-400 cursor-pointer"
+              >
+                تأیید و اعطای دسترسی (Allow)
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
