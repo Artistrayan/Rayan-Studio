@@ -40,7 +40,7 @@ const ALLOWED_CODE_EXTENSIONS = new Set([
 
 const ALLOWED_ASSET_EXTENSIONS = new Set([
   'png', 'jpg', 'jpeg', 'webp', 'svg',
-  'glb', 'gltf', 'obj', 'stl', 'fbx', 'ply',
+  'glb', 'gltf', 'obj', 'stl', 'fbx', 'ply', 'usd', 'usdz',
   'mp3', 'wav', 'ogg', 'm4a'
 ]);
 

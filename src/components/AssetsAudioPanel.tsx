@@ -11,6 +11,7 @@ import {
 import type { AssetFormat, AssetKind, RayanAsset, RayanProject } from '../types/studio';
 import { audioEngine } from '../engine/audioEngine';
 import { importZipPackage } from '../engine/zipHandler';
+import { inspectGLTFMetadata, dataUrlToArrayBuffer } from '../engine/threeModels';
 
 interface AssetsAudioPanelProps {
   project: RayanProject;
@@ -64,7 +65,7 @@ export const AssetsAudioPanel: React.FC<AssetsAudioPanelProps> = ({
     if (['png', 'jpg', 'jpeg', 'webp', 'svg'].includes(ext)) {
       return { kind: 'image', format: (ext === 'jpeg' ? 'jpg' : ext) as AssetFormat };
     }
-    if (['glb', 'gltf', 'obj', 'stl', 'fbx', 'ply'].includes(ext)) {
+    if (['glb', 'gltf', 'obj', 'stl', 'fbx', 'ply', 'usd', 'usdz'].includes(ext)) {
       return { kind: 'model3d', format: ext as AssetFormat };
     }
     if (['mp3', 'wav', 'ogg', 'm4a'].includes(ext)) {
@@ -94,7 +95,7 @@ export const AssetsAudioPanel: React.FC<AssetsAudioPanelProps> = ({
       const detected = detectKindAndFormat(file.name);
       if (!detected) {
         setUploadError(
-          `فرمت فایل «${file.name}» پشتیبانی نمی‌شود. فرمت‌های مجاز: PNG, JPG, SVG, GLB, GLTF, OBJ, STL, FBX, PLY, MP3, WAV, OGG, ZIP`
+          `فرمت فایل «${file.name}» پشتیبانی نمی‌شود. فرمت‌های مجاز: PNG, JPG, SVG, GLB, GLTF, FBX, OBJ, STL, USD, USDZ, PLY, MP3, WAV, OGG, ZIP`
         );
         continue;
       }
@@ -106,6 +107,17 @@ export const AssetsAudioPanel: React.FC<AssetsAudioPanelProps> = ({
         reader.readAsDataURL(file);
       });
 
+      let modelMeta = undefined;
+      if (detected.kind === 'model3d' && (detected.format === 'glb' || detected.format === 'gltf')) {
+        try {
+          const buf = dataUrlToArrayBuffer(dataUrl);
+          const meta = await inspectGLTFMetadata(buf);
+          modelMeta = { format: detected.format, ...meta };
+        } catch {
+          // ignore inspection error
+        }
+      }
+
       const asset: RayanAsset = {
         id: `asset_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
         name: file.name.replace(/\.[^.]+$/, ''),
@@ -114,6 +126,7 @@ export const AssetsAudioPanel: React.FC<AssetsAudioPanelProps> = ({
         dataUrl,
         sizeBytes: file.size,
         createdAt: Date.now(),
+        modelMeta,
       };
       onAddAsset(asset);
     }
@@ -145,7 +158,7 @@ export const AssetsAudioPanel: React.FC<AssetsAudioPanelProps> = ({
           <div className="space-y-1">
             <h2 className="text-lg font-bold text-slate-100">افزودن فایل، تصویر، مدل سه‌بعدی و صدا</h2>
             <p className="text-xs text-slate-400">
-              پشتیبانی واقعی از تصاویر (PNG, JPG, SVG, WebP)، مدل‌های سه‌بعدی (GLB, GLTF, OBJ, STL, FBX, PLY) و فایل‌های صوتی (MP3, WAV, OGG) به صورت آفلاین.
+              پشتیبانی واقعی از تصاویر (PNG, JPG, SVG, WebP)، مدل‌های سه‌بعدی (GLB, glTF, FBX, OBJ, STL, USD/USDZ) و فایل‌های صوتی (MP3, WAV, OGG) به صورت آفلاین.
             </p>
           </div>
           <div>
@@ -153,7 +166,7 @@ export const AssetsAudioPanel: React.FC<AssetsAudioPanelProps> = ({
               ref={fileInputRef}
               type="file"
               multiple
-              accept=".png,.jpg,.jpeg,.webp,.svg,.glb,.gltf,.obj,.stl,.fbx,.ply,.mp3,.wav,.ogg,.m4a,.zip"
+              accept=".png,.jpg,.jpeg,.webp,.svg,.glb,.gltf,.obj,.stl,.fbx,.ply,.usd,.usdz,.mp3,.wav,.ogg,.m4a,.zip"
               className="hidden"
               onChange={(e) => {
                 void handleFiles(e.target.files);
@@ -279,7 +292,9 @@ export const AssetsAudioPanel: React.FC<AssetsAudioPanelProps> = ({
       {/* 3D Models Library */}
       <section className="space-y-4">
         <div className="flex items-baseline justify-between">
-          <h3 className="text-base font-semibold text-slate-100">مدل‌های سه‌بعدی وارد شده (GLB, GLTF, OBJ, STL, FBX, PLY)</h3>
+          <h3 className="text-base font-semibold text-slate-100">
+            مدل‌های سه‌بعدی وارد شده (GLB, glTF, FBX, OBJ, STL, USD/USDZ)
+          </h3>
           <span className="text-xs text-slate-400 tabular-nums">{modelAssets.length} مدل</span>
         </div>
 
@@ -287,7 +302,7 @@ export const AssetsAudioPanel: React.FC<AssetsAudioPanelProps> = ({
           <div className="rounded-xl border border-slate-800 bg-[#131822] p-6 flex items-center gap-4 text-xs text-slate-400">
             <Box className="w-6 h-6 text-slate-600 shrink-0" />
             <span>
-              هنوز مدل سه‌بعدی خارجی وارد نکرده‌اید. از دکمه بالا فایل‌های GLB یا OBJ یا STL یا FBX را وارد کنید یا از مدل‌های سه‌بعدی آماده داخل ویرایشگر استفاده نمایید.
+              هنوز مدل سه‌بعدی خارجی وارد نکرده‌اید. از دکمه بالا فایل‌های GLB, glTF, FBX, OBJ, STL یا USD/USDZ را وارد کنید یا در محیط استودیوی سه‌بعدی چیدمان نمایید.
             </span>
           </div>
         ) : (
@@ -299,12 +314,43 @@ export const AssetsAudioPanel: React.FC<AssetsAudioPanelProps> = ({
                     <Box className="w-4 h-4 text-sky-400 shrink-0" />
                     <span className="text-sm font-semibold text-slate-100 truncate">{m.name}</span>
                   </div>
-                  <span className="text-xs text-slate-500 uppercase">{m.format}</span>
+                  <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-sky-500/15 text-sky-300 border border-sky-500/30 uppercase">
+                    {m.format}
+                  </span>
                 </div>
-                <div className="text-xs text-slate-500 tabular-nums">
-                  حجم: {Math.round(m.sizeBytes / 1024)} کیلوبایت
+
+                <div className="space-y-1 text-xs text-slate-400">
+                  <div className="flex items-center justify-between tabular-nums">
+                    <span>حجم فایل:</span>
+                    <span>{Math.round(m.sizeBytes / 1024)} کیلوبایت</span>
+                  </div>
+
+                  {m.modelMeta && (
+                    <div className="pt-2 border-t border-slate-800/80 space-y-1 text-[11px]">
+                      {m.modelMeta.vertexCount !== undefined && (
+                        <div className="flex items-center justify-between text-slate-400">
+                          <span>رأس‌ها / مثلث‌ها:</span>
+                          <span className="font-mono text-slate-300 tabular-nums">
+                            {m.modelMeta.vertexCount.toLocaleString()} / {m.modelMeta.triangleCount?.toLocaleString() || '-'}
+                          </span>
+                        </div>
+                      )}
+                      {m.modelMeta.animationCount !== undefined && m.modelMeta.animationCount > 0 && (
+                        <div className="flex items-center justify-between text-emerald-400">
+                          <span>انیمیشن‌ها:</span>
+                          <span className="font-mono tabular-nums">{m.modelMeta.animationCount} ترک</span>
+                        </div>
+                      )}
+                      {m.modelMeta.hasSkeleton && (
+                        <div className="text-amber-400 text-[10px]">
+                          ✓ اسکلت استخوان‌بندی و ریگ پویا
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
-                <div className="flex items-center gap-2">
+
+                <div className="flex items-center gap-2 pt-1">
                   <button
                     type="button"
                     onClick={() => onSpawnAssetToScene(m)}

@@ -332,7 +332,7 @@ export const CodeIdePanel: React.FC<CodeIdePanelProps> = ({
 
   const handleRunDiagnostics = async () => {
     setIsRunningDiagnostics(true);
-    pushConsole('info', 'در حال اجرای 22 آزمون تشخیصی یکپارچگی استودیو (امنیت، دسترسی، رانتایم و قوانین)...');
+    pushConsole('info', 'در حال اجرای 27 آزمون تشخیصی یکپارچگی استودیو (امنیت، دسترسی، رانتایم‌ها، قوانین و لودرهای سه‌بعدی)...');
 
     try {
       const report = await StudioTestRunner.runAll();
@@ -494,10 +494,10 @@ export const CodeIdePanel: React.FC<CodeIdePanelProps> = ({
             disabled={isRunningDiagnostics}
             onClick={handleRunDiagnostics}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-purple-500/40 bg-purple-500/10 text-xs font-semibold text-purple-300 hover:bg-purple-500/20 disabled:opacity-50 cursor-pointer"
-            title="اجرای ۲۲ آزمون تشخیصی یکپارچگی استودیو"
+            title="اجرای ۲۷ آزمون تشخیصی یکپارچگی استودیو (۵ مجموعه کامل)"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${isRunningDiagnostics ? 'animate-spin' : ''}`} />
-            {isRunningDiagnostics ? 'در حال اجرای آزمون‌ها...' : '۲۲ آزمون تشخیصی استودیو'}
+            {isRunningDiagnostics ? 'در حال اجرای آزمون‌ها...' : '۲۷ آزمون تشخیصی استودیو'}
           </button>
 
           <button

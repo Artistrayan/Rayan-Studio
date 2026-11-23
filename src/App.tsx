@@ -16,9 +16,19 @@ import { AssetsAudioPanel } from './components/AssetsAudioPanel';
 import { ExportView } from './components/ExportView';
 import { PWAInstallButton } from './components/PWAInstallButton';
 import { CodeIdePanel } from './components/CodeIdePanel';
+import { Studio3DView } from './components/Studio3DView';
+import { VisualUIBuilder } from './components/VisualUIBuilder';
 import { importZipPackage } from './engine/zipHandler';
 
-type StudioTab = 'editor' | 'code' | 'rules' | 'assets' | 'projects' | 'export';
+type StudioTab =
+  | 'editor'
+  | 'studio3d'
+  | 'uibuilder'
+  | 'code'
+  | 'rules'
+  | 'assets'
+  | 'projects'
+  | 'export';
 
 function synchronizeActiveScene(proj: RayanProject): RayanProject {
   const scenes = proj.scenes.map((sc) =>
@@ -328,6 +338,8 @@ export default function App() {
           {(
             [
               { id: 'editor', label: 'ویرایشگر صحنه' },
+              { id: 'studio3d', label: 'چیدمان سه‌بعدی (3D)' },
+              { id: 'uibuilder', label: 'طراحی رابط (UI)' },
               { id: 'code', label: 'محیط کدنویسی' },
               { id: 'rules', label: 'قوانین و هوش مصنوعی' },
               { id: 'assets', label: 'فایل‌ها و صدا' },
@@ -382,6 +394,29 @@ export default function App() {
           canRedo={historyMeta.canRedo}
           onUndo={handleUndo}
           onRedo={handleRedo}
+          onOpenStudio3D={() => setActiveTab('studio3d')}
+          onOpenUIBuilder={() => setActiveTab('uibuilder')}
+        />
+      )}
+
+      {activeTab === 'studio3d' && (
+        <Studio3DView
+          project={activeProject}
+          onUpdateProject={handleUpdateActiveProject}
+          onAddAsset={(asset) =>
+            handleUpdateActiveProject((prev) => ({
+              ...prev,
+              assets: [asset, ...prev.assets],
+              updatedAt: Date.now(),
+            }))
+          }
+        />
+      )}
+
+      {activeTab === 'uibuilder' && (
+        <VisualUIBuilder
+          project={activeProject}
+          onUpdateProject={handleUpdateActiveProject}
         />
       )}
 

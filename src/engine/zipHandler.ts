@@ -59,13 +59,15 @@ const MIME_MAP: Record<string, string> = {
   stl: 'application/octet-stream',
   fbx: 'application/octet-stream',
   ply: 'application/octet-stream',
+  usd: 'model/vnd.usd',
+  usdz: 'model/vnd.usdz+zip',
 };
 
 function detectAssetType(ext: string): { kind: AssetKind; format: AssetFormat } | null {
   if (['png', 'jpg', 'jpeg', 'webp', 'svg'].includes(ext)) {
     return { kind: 'image', format: (ext === 'jpeg' ? 'jpg' : ext) as AssetFormat };
   }
-  if (['glb', 'gltf', 'obj', 'stl', 'fbx', 'ply'].includes(ext)) {
+  if (['glb', 'gltf', 'obj', 'stl', 'fbx', 'ply', 'usd', 'usdz'].includes(ext)) {
     return { kind: 'model3d', format: ext as AssetFormat };
   }
   if (['mp3', 'wav', 'ogg', 'm4a'].includes(ext)) {

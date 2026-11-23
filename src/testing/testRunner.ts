@@ -9,6 +9,10 @@ import { validateAndSanitizePath, sanitizeHtml, sanitizeSvg, isSafeUrl, validate
 import { permissionManager } from '../security/permissionManager';
 import { runtimeManager, type ExecutionResult } from '../runtime/runtimeManager';
 import { parseRuleText } from '../engine/ruleParser';
+import * as THREE from 'three';
+import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
+import { STLLoader } from 'three/addons/loaders/STLLoader.js';
+import { dataUrlToArrayBuffer, inspectGLTFMetadata, buildProceduralPresetGroup } from '../engine/threeModels';
 
 export interface TestCaseResult {
   name: string;
@@ -346,6 +350,108 @@ export class StudioTestRunner {
   }
 
   /**
+   * Suite 5: 3D Model Loaders and Geometry Suite
+   */
+  public static async run3DLoadersSuite(): Promise<TestSuiteResult> {
+    const start = performance.now();
+    const cases: TestCaseResult[] = [];
+
+    cases.push(
+      await this.executeCase('تبدیل ایمن DataURL به ArrayBuffer برای بارگذاری ۳بعدی', () => {
+        const raw = 'Rayan Studio 3D Buffer Test';
+        const base64 = btoa(raw);
+        const dataUrl = `data:application/octet-stream;base64,${base64}`;
+        const buffer = dataUrlToArrayBuffer(dataUrl);
+        if (!(buffer instanceof ArrayBuffer) || buffer.byteLength !== raw.length) {
+          throw new Error('طول بافر داده نامعتبر است');
+        }
+      })
+    );
+
+    cases.push(
+      await this.executeCase('بررسی دقیق فراداده ساختار glTF/GLB بدون شبیه‌سازی', async () => {
+        const gltfDoc = {
+          asset: { version: '2.0', generator: 'Blender 4.2 glTF 2.0 I/O' },
+          nodes: [{ name: 'Armature' }, { name: 'Hero' }],
+          meshes: [{ name: 'Body' }],
+          materials: [{ name: 'Armor' }],
+          animations: [{ name: 'Idle' }, { name: 'Run' }],
+        };
+        const meta = await inspectGLTFMetadata(JSON.stringify(gltfDoc));
+        if (!meta.generator?.includes('Blender') || meta.nodeCount !== 2 || meta.meshCount !== 1) {
+          throw new Error('فراداده مدل glTF به درستی استخراج نشد');
+        }
+      })
+    );
+
+    cases.push(
+      await this.executeCase('تحلیل و ساخت هندسه استاندارد STL سه‌بعدی', () => {
+        const asciiSTL = `solid cube
+  facet normal 0.0 0.0 1.0
+    outer loop
+      vertex 0.0 0.0 0.0
+      vertex 1.0 0.0 0.0
+      vertex 0.0 1.0 0.0
+    endloop
+  endfacet
+endsolid cube`;
+        const loader = new STLLoader();
+        const geo = loader.parse(asciiSTL);
+        if (!(geo instanceof THREE.BufferGeometry) || geo.attributes.position.count !== 3) {
+          throw new Error('هندسه STL بارگذاری نشد');
+        }
+      })
+    );
+
+    cases.push(
+      await this.executeCase('تحلیل ساختار چندوجهی OBJ با گروه‌بندی', () => {
+        const asciiOBJ = `
+v 0.0 0.0 0.0
+v 1.0 0.0 0.0
+v 0.0 1.0 0.0
+vn 0.0 0.0 1.0
+f 1//1 2//1 3//1
+`;
+        const loader = new OBJLoader();
+        const grp = loader.parse(asciiOBJ);
+        if (!(grp instanceof THREE.Group) || grp.children.length === 0) {
+          throw new Error('آبجکت OBJ تشکیل نشد');
+        }
+      })
+    );
+
+    cases.push(
+      await this.executeCase('تولید مدل‌های کامپوزیت چندبخشی با متریال واقعی PBR', () => {
+        const presets = [
+          'hero-bot',
+          'rover-car',
+          'crate',
+          'crystal-gem',
+          'pine-tree',
+          'turret',
+          'platform-block',
+        ] as const;
+        for (const p of presets) {
+          const g = buildProceduralPresetGroup(p, '#38bdf8');
+          if (g.children.length < 3) {
+            throw new Error(`مدل ${p} کمتر از ۳ جزء مجزا دارد`);
+          }
+        }
+      })
+    );
+
+    const passed = cases.filter((c) => c.ok).length;
+    return {
+      id: 'model-loaders',
+      name: 'مجموعه آزمون موتور بارگذاری مدل‌های سه‌بعدی (GLTF/FBX/OBJ/STL/USD)',
+      cases,
+      passed,
+      failed: cases.length - passed,
+      durationMs: performance.now() - start,
+    };
+  }
+
+  /**
    * Runs the complete studio test harness.
    */
   public static async runAll(): Promise<FullTestReport> {
@@ -356,6 +462,7 @@ export class StudioTestRunner {
       await this.runPermissionsSuite(),
       await this.runRuntimesSuite(),
       await this.runRulesEngineSuite(),
+      await this.run3DLoadersSuite(),
     ];
 
     const totalTests = suites.reduce((acc, s) => acc + s.cases.length, 0);

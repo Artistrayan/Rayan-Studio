@@ -67,6 +67,8 @@ interface SceneEditorWorkspaceProps {
   canRedo: boolean;
   onUndo: () => void;
   onRedo: () => void;
+  onOpenStudio3D?: () => void;
+  onOpenUIBuilder?: () => void;
 }
 
 const SCREEN_PRESETS: Array<{
@@ -180,6 +182,8 @@ export const SceneEditorWorkspace: React.FC<SceneEditorWorkspaceProps> = ({
   canRedo,
   onUndo,
   onRedo,
+  onOpenStudio3D,
+  onOpenUIBuilder,
 }) => {
   const [selectedEntityId, setSelectedEntityId] = useState<string | null>(
     project.entities[0]?.id || null
@@ -1160,7 +1164,31 @@ export const SceneEditorWorkspace: React.FC<SceneEditorWorkspaceProps> = ({
                 <Scaling className="w-3.5 h-3.5" />
                 <span>اندازه</span>
               </button>
+              {onOpenStudio3D && (
+                <button
+                  type="button"
+                  onClick={onOpenStudio3D}
+                  title="باز کردن استودیوی تخصصی چیدمان چندمدلی با امکان بارگذاری صدها مدل، گروه‌بندی و ساختار صحنه"
+                  className="flex items-center gap-1.5 px-2 py-1 rounded-md text-xs font-semibold bg-sky-950/80 border border-sky-600/50 text-sky-300 hover:bg-sky-900 hover:text-white transition-colors whitespace-nowrap ml-1"
+                >
+                  <Box className="w-3.5 h-3.5" />
+                  <span>استودیو چندمدلی 3D</span>
+                </button>
+              )}
             </div>
+          )}
+
+          {/* Quick UI Builder Shortcut */}
+          {!isPlaying && onOpenUIBuilder && (
+            <button
+              type="button"
+              onClick={onOpenUIBuilder}
+              title="طراحی و ساخت بصری رابط کاربری، فرم‌ها، منوها و دکمه‌ها"
+              className="hidden lg:flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium bg-slate-900 border border-slate-700/80 text-indigo-300 hover:bg-slate-800 hover:text-white transition-colors whitespace-nowrap"
+            >
+              <Layers className="w-3.5 h-3.5 text-indigo-400" />
+              <span>طراحی رابط UI</span>
+            </button>
           )}
 
           {/* Screen Size Selector */}

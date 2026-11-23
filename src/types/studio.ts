@@ -27,10 +27,26 @@ export type AssetFormat =
   | 'stl'
   | 'fbx'
   | 'ply'
+  | 'usd'
+  | 'usdz'
   | 'mp3'
   | 'wav'
   | 'ogg'
   | 'synth';
+
+export interface Model3DMetadata {
+  format: AssetFormat;
+  vertexCount?: number;
+  triangleCount?: number;
+  meshCount?: number;
+  materialCount?: number;
+  animationCount?: number;
+  animationNames?: string[];
+  hasSkeleton?: boolean;
+  hasTextures?: boolean;
+  generator?: string;
+  nodeCount?: number;
+}
 
 export interface RayanAsset {
   id: string;
@@ -41,6 +57,7 @@ export interface RayanAsset {
   dataUrl: string;
   sizeBytes: number;
   createdAt: number;
+  modelMeta?: Model3DMetadata;
 }
 
 export type EntityRole =
