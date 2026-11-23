@@ -1,10 +1,11 @@
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
- * Rayan Studio - Production Multi-Model 3D Layout Environment
- * Supports hundreds of concurrent 3D models (GLB, glTF, FBX, OBJ, STL, USD/USDZ),
- * independent selection, TransformControls gizmo, grouping/ungrouping, layers & folders,
- * and complete scene hierarchy panel.
+ * Rayan Studio - Production Multi-Model 3D Studio & Scene Graph Editor
+ * Supports hundreds of concurrent models (GLB, glTF, FBX, OBJ, STL, USD/USDZ, PLY),
+ * basic 3D primitives, multi-part procedural rigs, PointLights, true recursive
+ * Parent-Child Hierarchy, independent multi-object selection & TransformControls gizmos,
+ * IndexedDB project persistence, and real GLB scene export.
  */
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -12,61 +13,63 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 import {
+  AlertCircle,
   Box,
+  CheckCircle2,
   ChevronDown,
   ChevronRight,
   Copy,
+  Download,
   Eye,
   EyeOff,
+  Focus,
   Folder,
   FolderPlus,
+  FolderTree,
   Layers,
+  Lightbulb,
   Lock,
   Maximize2,
   Move,
-  Orbit,
+  Pause,
   Play,
   Plus,
   RotateCw,
+  Save,
   Search,
+  Shapes,
   Trash2,
+  Ungroup,
   Unlock,
   Upload,
-  FolderTree,
-  Pause,
 } from 'lucide-react';
-import type { Model3DPresetType, RayanAsset, RayanProject } from '../types/studio';
+import type {
+  AssetFormat,
+  Model3DPresetType,
+  Primitive3DType,
+  RayanAsset,
+  RayanProject,
+  SceneNode3D,
+} from '../types/studio';
 import {
+  applyColorAndPbrToGroup,
+  buildLight3DGroup,
+  buildPrimitive3DGroup,
   buildProceduralPresetGroup,
+  disposeObject3D,
   loadCustom3DAsset,
-  dataUrlToArrayBuffer,
-  inspectGLTFMetadata,
+  parseAndInspect3DModelFile,
 } from '../engine/threeModels';
+import { arrayBufferToDataUrl, saveAssetToDb } from '../storage/projectDb';
 
-export interface SceneNode3D {
-  id: string;
-  name: string;
-  kind: 'model-asset' | 'model-preset' | 'group' | 'light';
-  preset?: Model3DPresetType;
-  assetId?: string;
-  format?: string;
-  position: [number, number, number];
-  rotation: [number, number, number]; // Euler angles in degrees
-  scale: [number, number, number];
-  color: string;
-  visible: boolean;
-  locked: boolean;
-  parentId?: string | null;
-  layerId: string;
-  folder?: string;
-  animations?: string[];
-}
+export type { SceneNode3D };
 
 export interface Studio3DViewProps {
   project: RayanProject;
-  onUpdateProject?: (updater: (prev: RayanProject) => RayanProject) => void;
-  onAddAsset?: (asset: RayanAsset) => void;
+  onUpdateProject?: (updater: (prev: RayanProject) => RayanProject, skipHistory?: boolean) => void;
+  onAddAsset?: (asset: RayanAsset) => void | Promise<void>;
 }
 
 const DEFAULT_LAYERS = [
@@ -77,89 +80,328 @@ const DEFAULT_LAYERS = [
   { id: 'lighting', name: 'نورپردازی و افکت‌ها', color: '#c084fc' },
 ];
 
+const PRIMITIVE_CATALOG: Array<{ type: Primitive3DType; label: string; color: string }> = [
+  { type: 'box', label: 'مکعب (Box)', color: '#38bdf8' },
+  { type: 'sphere', label: 'کره (Sphere)', color: '#a855f7' },
+  { type: 'cylinder', label: 'استوانه (Cylinder)', color: '#f59e0b' },
+  { type: 'cone', label: 'مخروط (Cone)', color: '#ef4444' },
+  { type: 'torus', label: 'حلقه (Torus)', color: '#10b981' },
+  { type: 'capsule', label: 'کپسول (Capsule)', color: '#ec4899' },
+  { type: 'plane', label: 'صفحه (Plane)', color: '#64748b' },
+];
+
+const PRESET_CATALOG: Array<{ preset: Model3DPresetType; label: string; color: string; textCls: string }> = [
+  { preset: 'hero-bot', label: 'ربات قهرمان', color: '#38bdf8', textCls: 'text-sky-300' },
+  { preset: 'rover-car', label: 'ماشین کاوشگر', color: '#f59e0b', textCls: 'text-amber-300' },
+  { preset: 'turret', label: 'برجک تدافعی', color: '#ef4444', textCls: 'text-red-300' },
+  { preset: 'crystal-gem', label: 'کریستال انرژی', color: '#10b981', textCls: 'text-emerald-300' },
+  { preset: 'pine-tree', label: 'درخت کاج', color: '#14b8a6', textCls: 'text-teal-300' },
+  { preset: 'crate', label: 'جعبه انبار', color: '#fb923c', textCls: 'text-orange-300' },
+  { preset: 'platform-block', label: 'سکوی فلزی', color: '#64748b', textCls: 'text-slate-300' },
+];
+
+const DEFAULT_STARTER_NODES: SceneNode3D[] = [
+  {
+    id: 'node_hero_1',
+    name: 'ربات قهرمان (Hero Bot)',
+    kind: 'model-preset',
+    preset: 'hero-bot',
+    position: [0, 0, 0],
+    rotation: [0, 0, 0],
+    scale: [1, 1, 1],
+    color: '#38bdf8',
+    roughness: 0.42,
+    metalness: 0.25,
+    visible: true,
+    locked: false,
+    parentId: null,
+    layerId: 'characters',
+  },
+  {
+    id: 'node_group_props',
+    name: 'گروه تجهیزات صحنه',
+    kind: 'group',
+    position: [0, 0, 0],
+    rotation: [0, 0, 0],
+    scale: [1, 1, 1],
+    color: '#fbbf24',
+    visible: true,
+    locked: false,
+    parentId: null,
+    layerId: 'props',
+  },
+  {
+    id: 'node_turret_1',
+    name: 'برجک دفاعی',
+    kind: 'model-preset',
+    preset: 'turret',
+    position: [2.5, 0, -1],
+    rotation: [0, -35, 0],
+    scale: [1, 1, 1],
+    color: '#ef4444',
+    roughness: 0.42,
+    metalness: 0.25,
+    visible: true,
+    locked: false,
+    parentId: 'node_group_props',
+    layerId: 'props',
+  },
+  {
+    id: 'node_gem_1',
+    name: 'کریستال انرژی',
+    kind: 'model-preset',
+    preset: 'crystal-gem',
+    position: [-2.2, 0, 1.2],
+    rotation: [0, 45, 0],
+    scale: [1, 1, 1],
+    color: '#10b981',
+    roughness: 0.3,
+    metalness: 0.35,
+    visible: true,
+    locked: false,
+    parentId: 'node_group_props',
+    layerId: 'props',
+  },
+];
+
+function buildInitialNodesFromProject(proj: RayanProject): SceneNode3D[] {
+  if (Array.isArray(proj.studio3dNodes) && proj.studio3dNodes.length > 0) {
+    return proj.studio3dNodes;
+  }
+  const entityAssetNodes: SceneNode3D[] = proj.entities
+    .filter((e) => e.kind === 'model3d-asset' && e.assetId)
+    .map((e) => {
+      const asset = proj.assets.find((a) => a.id === e.assetId);
+      return {
+        id: `node_${e.id}`,
+        name: e.name,
+        kind: 'model-asset' as const,
+        assetId: e.assetId,
+        format: asset?.format?.toUpperCase(),
+        position: [e.x, e.y, e.z],
+        rotation: [e.rotationX, e.rotationY, e.rotationZ],
+        scale: [1, 1, 1],
+        color: e.color || '#38bdf8',
+        visible: e.visible,
+        locked: Boolean(e.locked),
+        parentId: null,
+        layerId: 'characters',
+        animations: asset?.modelMeta?.animationNames,
+      };
+    });
+
+  return [...DEFAULT_STARTER_NODES, ...entityAssetNodes];
+}
+
+function isDescendantOf(
+  candidateId: string,
+  potentialAncestorId: string,
+  nodeMap: Map<string, SceneNode3D>
+): boolean {
+  let cur = nodeMap.get(candidateId);
+  const visited = new Set<string>();
+  while (cur && cur.parentId) {
+    if (cur.parentId === potentialAncestorId) return true;
+    if (visited.has(cur.parentId)) break;
+    visited.add(cur.parentId);
+    cur = nodeMap.get(cur.parentId);
+  }
+  return false;
+}
+
+function isEffectiveVisible(nodeId: string, nodeMap: Map<string, SceneNode3D>): boolean {
+  let cur = nodeMap.get(nodeId);
+  const visited = new Set<string>();
+  while (cur) {
+    if (!cur.visible) return false;
+    if (!cur.parentId || visited.has(cur.parentId)) break;
+    visited.add(cur.parentId);
+    cur = nodeMap.get(cur.parentId);
+  }
+  return true;
+}
+
+function isEffectiveLocked(nodeId: string, nodeMap: Map<string, SceneNode3D>): boolean {
+  let cur = nodeMap.get(nodeId);
+  const visited = new Set<string>();
+  while (cur) {
+    if (cur.locked) return true;
+    if (!cur.parentId || visited.has(cur.parentId)) break;
+    visited.add(cur.parentId);
+    cur = nodeMap.get(cur.parentId);
+  }
+  return false;
+}
+
+interface MultiDragSnapshot {
+  pivotStartInv: THREE.Matrix4;
+  items: Array<{
+    nodeId: string;
+    obj: THREE.Group;
+    worldStart: THREE.Matrix4;
+    parentWorldInv: THREE.Matrix4;
+  }>;
+}
+
+const _tmpVec = new THREE.Vector3();
+const _tmpQuat = new THREE.Quaternion();
+const _tmpEuler = new THREE.Euler();
+const _tmpScale = new THREE.Vector3();
+const _tmpMatA = new THREE.Matrix4();
+const _tmpMatB = new THREE.Matrix4();
+
 export const Studio3DView: React.FC<Studio3DViewProps> = ({
   project,
   onUpdateProject,
   onAddAsset,
 }) => {
-  // --- Multi-Model Scene State ---
-  const [nodes, setNodes] = useState<SceneNode3D[]>(() => [
-    {
-      id: 'node_hero_1',
-      name: 'ربات قهرمان (Hero Bot)',
-      kind: 'model-preset',
-      preset: 'hero-bot',
-      position: [0, 0, 0],
-      rotation: [0, 0, 0],
-      scale: [1, 1, 1],
-      color: '#38bdf8',
-      visible: true,
-      locked: false,
-      parentId: null,
-      layerId: 'characters',
-      folder: 'شخصیت‌ها',
-    },
-    {
-      id: 'node_turret_1',
-      name: 'برجک دفاعی',
-      kind: 'model-preset',
-      preset: 'turret',
-      position: [2.5, 0, -1],
-      rotation: [0, -35, 0],
-      scale: [1, 1, 1],
-      color: '#ef4444',
-      visible: true,
-      locked: false,
-      parentId: null,
-      layerId: 'props',
-      folder: 'تجهیزات',
-    },
-    {
-      id: 'node_gem_1',
-      name: 'کریستال انرژی',
-      kind: 'model-preset',
-      preset: 'crystal-gem',
-      position: [-2.2, 0, 1.2],
-      rotation: [0, 45, 0],
-      scale: [1, 1, 1],
-      color: '#10b981',
-      visible: true,
-      locked: false,
-      parentId: null,
-      layerId: 'props',
-      folder: 'آیتم‌ها',
-    },
-  ]);
+  const [nodes, setNodes] = useState<SceneNode3D[]>(() => buildInitialNodesFromProject(project));
+  const [selectedIds, setSelectedIds] = useState<string[]>(() => {
+    const init = buildInitialNodesFromProject(project);
+    const firstSelectable = init.find((n) => n.kind !== 'group') || init[0];
+    return firstSelectable ? [firstSelectable.id] : [];
+  });
 
-  const [selectedId, setSelectedId] = useState<string | null>('node_hero_1');
   const [transformMode, setTransformMode] = useState<'translate' | 'rotate' | 'scale'>('translate');
   const [spaceMode, setSpaceMode] = useState<'world' | 'local'>('world');
   const [searchQuery, setSearchQuery] = useState('');
-  const [expandedFolders, setExpandedFolders] = useState<Record<string, boolean>>({
-    'شخصیت‌ها': true,
-    'تجهیزات': true,
-    'آیتم‌ها': true,
-    'مدل‌های وارد شده': true,
+  const [paletteTab, setPaletteTab] = useState<'primitives' | 'presets' | 'assets'>('primitives');
+  const [importError, setImportError] = useState<string | null>(null);
+  const [importStatus, setImportStatus] = useState<string | null>(null);
+  const [saveFeedback, setSaveFeedback] = useState<string | null>(null);
+  const [isDraggingFile, setIsDraggingFile] = useState(false);
+  const [draggedNodeId, setDraggedNodeId] = useState<string | null>(null);
+
+  const [expandedNodeIds, setExpandedNodeIds] = useState<Record<string, boolean>>({
+    node_group_props: true,
   });
 
   // Animation playback
   const [isPlayingAnimations, setIsPlayingAnimations] = useState(true);
   const [animSpeed, setAnimSpeed] = useState(1);
+  const isPlayingAnimRef = useRef(true);
+  const animSpeedRef = useRef(1);
 
-  // Viewport refs
+  useEffect(() => {
+    isPlayingAnimRef.current = isPlayingAnimations;
+  }, [isPlayingAnimations]);
+
+  useEffect(() => {
+    animSpeedRef.current = animSpeed;
+  }, [animSpeed]);
+
+  // Sync external additions to project.studio3dNodes (e.g. spawned from AssetsAudioPanel)
+  useEffect(() => {
+    if (!project.studio3dNodes || project.studio3dNodes.length === 0) return;
+    setNodes((prev) => {
+      const prevIds = new Set(prev.map((n) => n.id));
+      const newOnes = project.studio3dNodes!.filter((n) => !prevIds.has(n.id));
+      if (newOnes.length === 0) return prev;
+      setSelectedIds([newOnes[newOnes.length - 1].id]);
+      return [...prev, ...newOnes];
+    });
+  }, [project.studio3dNodes]);
+
+  const persistNodesToProject = useCallback(
+    (nextNodes: SceneNode3D[], skipHistory = false) => {
+      onUpdateProject?.(
+        (prev) => ({
+          ...prev,
+          studio3dNodes: nextNodes,
+          updatedAt: Date.now(),
+        }),
+        skipHistory
+      );
+    },
+    [onUpdateProject]
+  );
+
+  // Refs for Three.js scene
   const mountRef = useRef<HTMLDivElement | null>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const orbitRef = useRef<OrbitControls | null>(null);
   const transformRef = useRef<TransformControls | null>(null);
+  const multiPivotRef = useRef<THREE.Group | null>(null);
+  const selectionHelpersRef = useRef<THREE.Group | null>(null);
+  const boxHelpersMapRef = useRef<Map<string, THREE.BoxHelper>>(new Map());
   const modelObjectsRef = useRef<Map<string, THREE.Group>>(new Map());
   const mixersRef = useRef<Map<string, THREE.AnimationMixer>>(new Map());
   const clockRef = useRef<THREE.Clock>(new THREE.Clock());
+  const multiDragSnapshotRef = useRef<MultiDragSnapshot | null>(null);
+
+  const nodesRef = useRef<SceneNode3D[]>(nodes);
+  nodesRef.current = nodes;
+  const selectedIdsRef = useRef<string[]>(selectedIds);
+  selectedIdsRef.current = selectedIds;
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Sync TransformControls mode
+  const nodeMap = useMemo(() => {
+    const m = new Map<string, SceneNode3D>();
+    nodes.forEach((n) => m.set(n.id, n));
+    return m;
+  }, [nodes]);
+
+  const primarySelectedId = selectedIds.length > 0 ? selectedIds[selectedIds.length - 1] : null;
+  const selectedNode = useMemo(
+    () => (selectedIds.length === 1 ? nodeMap.get(selectedIds[0]) || null : null),
+    [selectedIds, nodeMap]
+  );
+
+  const project3DAssets = useMemo(
+    () => project.assets.filter((a) => a.kind === 'model3d'),
+    [project.assets]
+  );
+
+  // Build visible flat list order for Shift-range selection in tree
+  const { rootNodes, childrenByParent, flattenedTreeIds } = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    const map = new Map<string, SceneNode3D[]>();
+    const roots: SceneNode3D[] = [];
+
+    const matchesQuery = (node: SceneNode3D): boolean => {
+      if (!q) return true;
+      return (
+        node.name.toLowerCase().includes(q) ||
+        (node.format && node.format.toLowerCase().includes(q)) ||
+        node.kind.toLowerCase().includes(q)
+      );
+    };
+
+    nodes.forEach((n) => {
+      const pid = n.parentId && nodeMap.has(n.parentId) && n.parentId !== n.id ? n.parentId : null;
+      if (!pid) {
+        roots.push(n);
+      } else {
+        const arr = map.get(pid) || [];
+        arr.push(n);
+        map.set(pid, arr);
+      }
+    });
+
+    const visibleFlat: string[] = [];
+    const walk = (list: SceneNode3D[]) => {
+      for (const item of list) {
+        const children = map.get(item.id) || [];
+        const hasMatchDescendant = (id: string): boolean => {
+          const ch = map.get(id) || [];
+          return ch.some((c) => matchesQuery(c) || hasMatchDescendant(c.id));
+        };
+        if (!matchesQuery(item) && !hasMatchDescendant(item.id)) continue;
+        visibleFlat.push(item.id);
+        if ((expandedNodeIds[item.id] ?? true) && children.length > 0) {
+          walk(children);
+        }
+      }
+    };
+    walk(roots);
+
+    return { rootNodes: roots, childrenByParent: map, flattenedTreeIds: visibleFlat };
+  }, [nodes, nodeMap, searchQuery, expandedNodeIds]);
+
+  // Sync TransformControls mode & space
   useEffect(() => {
     if (transformRef.current) {
       transformRef.current.setMode(transformMode);
@@ -167,187 +409,790 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
     }
   }, [transformMode, spaceMode]);
 
-  // Selected Node lookup
-  const selectedNode = useMemo(() => {
-    return nodes.find((n) => n.id === selectedId) || null;
-  }, [nodes, selectedId]);
+  // Helper to attach TransformControls cleanly for either 1 object or N objects via multiPivotRef
+  const syncTransformGizmoAttachment = useCallback(() => {
+    const tc = transformRef.current;
+    const pivot = multiPivotRef.current;
+    const scene = sceneRef.current;
+    if (!tc || !pivot || !scene) return;
 
-  // Toggle folder expansion
-  const toggleFolder = (folderName: string) => {
-    setExpandedFolders((prev) => ({ ...prev, [folderName]: !prev[folderName] }));
-  };
+    const currentNodes = nodesRef.current;
+    const currentMap = new Map<string, SceneNode3D>();
+    currentNodes.forEach((n) => currentMap.set(n.id, n));
 
-  // Grouping & organizing
-  const groupedNodes = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase();
-    const filtered = q
-      ? nodes.filter((n) => n.name.toLowerCase().includes(q) || (n.folder && n.folder.toLowerCase().includes(q)))
-      : nodes;
-
-    const map: Record<string, SceneNode3D[]> = {};
-    filtered.forEach((n) => {
-      const f = n.folder || 'بدون پوشه';
-      if (!map[f]) map[f] = [];
-      map[f].push(n);
+    const validIds = selectedIdsRef.current.filter((id) => {
+      const n = currentMap.get(id);
+      if (!n) return false;
+      if (isEffectiveLocked(id, currentMap)) return false;
+      if (!isEffectiveVisible(id, currentMap)) return false;
+      return modelObjectsRef.current.has(id);
     });
-    return map;
-  }, [nodes, searchQuery]);
 
-  // Update node properties
-  const updateNode = useCallback((id: string, patch: Partial<SceneNode3D>) => {
-    setNodes((prev) =>
-      prev.map((n) => {
-        if (n.id !== id) return n;
-        const next = { ...n, ...patch };
-        // Sync 3D object if exists
-        const obj = modelObjectsRef.current.get(id);
-        if (obj) {
-          if (patch.position) obj.position.set(...patch.position);
-          if (patch.rotation) {
-            obj.rotation.set(
-              THREE.MathUtils.degToRad(patch.rotation[0]),
-              THREE.MathUtils.degToRad(patch.rotation[1]),
-              THREE.MathUtils.degToRad(patch.rotation[2])
-            );
-          }
-          if (patch.scale) obj.scale.set(...patch.scale);
-          if (patch.visible !== undefined) obj.visible = patch.visible;
-        }
-        return next;
-      })
-    );
+    if (validIds.length === 0) {
+      tc.detach();
+      return;
+    }
+
+    if (validIds.length === 1) {
+      const obj = modelObjectsRef.current.get(validIds[0]);
+      if (obj) {
+        tc.attach(obj);
+      } else {
+        tc.detach();
+      }
+      return;
+    }
+
+    // Multiple objects selected: ignore any child whose ancestor is also selected
+    const selectedSet = new Set(validIds);
+    const rootSelectedIds = validIds.filter((id) => {
+      let cur = currentMap.get(id);
+      while (cur && cur.parentId) {
+        if (selectedSet.has(cur.parentId)) return false;
+        cur = currentMap.get(cur.parentId);
+      }
+      return true;
+    });
+
+    if (rootSelectedIds.length === 1) {
+      const obj = modelObjectsRef.current.get(rootSelectedIds[0]);
+      if (obj) tc.attach(obj);
+      return;
+    }
+
+    // Compute world centroid
+    const centroid = new THREE.Vector3();
+    let count = 0;
+    scene.updateMatrixWorld(true);
+    for (const id of rootSelectedIds) {
+      const obj = modelObjectsRef.current.get(id);
+      if (obj) {
+        obj.getWorldPosition(_tmpVec);
+        centroid.add(_tmpVec);
+        count++;
+      }
+    }
+    if (count === 0) {
+      tc.detach();
+      return;
+    }
+    centroid.divideScalar(count);
+    pivot.position.copy(centroid);
+    pivot.rotation.set(0, 0, 0);
+    pivot.scale.set(1, 1, 1);
+    pivot.updateMatrixWorld(true);
+    tc.attach(pivot);
   }, []);
 
-  // Duplicate model
-  const duplicateNode = (node: SceneNode3D) => {
-    const nextId = `node_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-    const cloned: SceneNode3D = {
-      ...node,
-      id: nextId,
-      name: `${node.name} (کپی)`,
-      position: [node.position[0] + 0.8, node.position[1], node.position[2] + 0.8],
+  // Update node properties
+  const updateNode = useCallback(
+    (id: string, patch: Partial<SceneNode3D>, commitHistory = false) => {
+      setNodes((prev) => {
+        const nextNodes = prev.map((n) => {
+          if (n.id !== id) return n;
+          const next = { ...n, ...patch };
+          const obj = modelObjectsRef.current.get(id);
+          if (obj) {
+            if (patch.position) obj.position.set(...patch.position);
+            if (patch.rotation) {
+              obj.rotation.set(
+                THREE.MathUtils.degToRad(patch.rotation[0]),
+                THREE.MathUtils.degToRad(patch.rotation[1]),
+                THREE.MathUtils.degToRad(patch.rotation[2])
+              );
+            }
+            if (patch.scale) obj.scale.set(...patch.scale);
+            if (patch.visible !== undefined) obj.visible = patch.visible;
+            if (
+              patch.color !== undefined ||
+              patch.roughness !== undefined ||
+              patch.metalness !== undefined ||
+              patch.lightIntensity !== undefined
+            ) {
+              applyColorAndPbrToGroup(
+                obj,
+                next.color,
+                next.roughness,
+                next.metalness,
+                next.lightIntensity
+              );
+            }
+          }
+          return next;
+        });
+        persistNodesToProject(nextNodes, !commitHistory);
+        return nextNodes;
+      });
+    },
+    [persistNodesToProject]
+  );
+
+  // Reparent a node while preserving its world transform
+  const reparentNode = useCallback(
+    (childId: string, newParentId: string | null) => {
+      if (childId === newParentId) return;
+      setNodes((prev) => {
+        const map = new Map<string, SceneNode3D>();
+        prev.forEach((n) => map.set(n.id, n));
+        const childNode = map.get(childId);
+        if (!childNode) return prev;
+        if ((childNode.parentId || null) === newParentId) return prev;
+        if (newParentId && isDescendantOf(newParentId, childId, map)) {
+          setImportError('امکان انتقال یک گروه به درون زیرمجموعه خودش وجود ندارد.');
+          return prev;
+        }
+
+        const childObj = modelObjectsRef.current.get(childId);
+        const newParentObj = newParentId ? modelObjectsRef.current.get(newParentId) : sceneRef.current;
+
+        let localPos = childNode.position;
+        let localRot = childNode.rotation;
+        let localScale = childNode.scale;
+
+        if (childObj && newParentObj && sceneRef.current) {
+          sceneRef.current.updateMatrixWorld(true);
+          newParentObj.attach(childObj);
+          localPos = [
+            Number(childObj.position.x.toFixed(3)),
+            Number(childObj.position.y.toFixed(3)),
+            Number(childObj.position.z.toFixed(3)),
+          ];
+          localRot = [
+            Number(THREE.MathUtils.radToDeg(childObj.rotation.x).toFixed(1)),
+            Number(THREE.MathUtils.radToDeg(childObj.rotation.y).toFixed(1)),
+            Number(THREE.MathUtils.radToDeg(childObj.rotation.z).toFixed(1)),
+          ];
+          localScale = [
+            Number(childObj.scale.x.toFixed(3)),
+            Number(childObj.scale.y.toFixed(3)),
+            Number(childObj.scale.z.toFixed(3)),
+          ];
+        }
+
+        const next = prev.map((n) =>
+          n.id === childId
+            ? {
+                ...n,
+                parentId: newParentId,
+                position: localPos,
+                rotation: localRot,
+                scale: localScale,
+              }
+            : n
+        );
+        persistNodesToProject(next);
+        return next;
+      });
+
+      if (newParentId) {
+        setExpandedNodeIds((prev) => ({ ...prev, [newParentId]: true }));
+      }
+    },
+    [persistNodesToProject]
+  );
+
+  // Create real Group node around selected items (or empty group)
+  const handleGroupSelected = useCallback(() => {
+    const ids = selectedIdsRef.current;
+    const currentNodes = nodesRef.current;
+    const map = new Map<string, SceneNode3D>();
+    currentNodes.forEach((n) => map.set(n.id, n));
+
+    const groupId = `node_group_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
+    const groupCount = currentNodes.filter((n) => n.kind === 'group').length + 1;
+
+    if (ids.length === 0) {
+      const emptyGroup: SceneNode3D = {
+        id: groupId,
+        name: `گروه ${groupCount}`,
+        kind: 'group',
+        position: [0, 0, 0],
+        rotation: [0, 0, 0],
+        scale: [1, 1, 1],
+        color: '#fbbf24',
+        visible: true,
+        locked: false,
+        parentId: null,
+        layerId: 'default',
+      };
+      setNodes((prev) => {
+        const next = [...prev, emptyGroup];
+        persistNodesToProject(next);
+        return next;
+      });
+      setSelectedIds([groupId]);
+      setExpandedNodeIds((prev) => ({ ...prev, [groupId]: true }));
+      return;
+    }
+
+    // Group selected nodes at their world centroid
+    const selectedSet = new Set(ids);
+    const rootSelected = ids.filter((id) => {
+      let cur = map.get(id);
+      while (cur && cur.parentId) {
+        if (selectedSet.has(cur.parentId)) return false;
+        cur = map.get(cur.parentId);
+      }
+      return true;
+    });
+
+    const centroid = new THREE.Vector3();
+    let cnt = 0;
+    if (sceneRef.current) sceneRef.current.updateMatrixWorld(true);
+    for (const id of rootSelected) {
+      const obj = modelObjectsRef.current.get(id);
+      if (obj) {
+        obj.getWorldPosition(_tmpVec);
+        centroid.add(_tmpVec);
+        cnt++;
+      } else {
+        const n = map.get(id);
+        if (n) {
+          centroid.add(new THREE.Vector3(...n.position));
+          cnt++;
+        }
+      }
+    }
+    if (cnt > 0) centroid.divideScalar(cnt);
+
+    const groupNode: SceneNode3D = {
+      id: groupId,
+      name: `گروه ${groupCount}`,
+      kind: 'group',
+      position: [
+        Number(centroid.x.toFixed(3)),
+        Number(centroid.y.toFixed(3)),
+        Number(centroid.z.toFixed(3)),
+      ],
+      rotation: [0, 0, 0],
+      scale: [1, 1, 1],
+      color: '#fbbf24',
+      visible: true,
+      locked: false,
+      parentId: null,
+      layerId: 'default',
     };
-    setNodes((prev) => [...prev, cloned]);
-    setSelectedId(nextId);
-  };
 
-  // Delete model
-  const deleteNode = (id: string) => {
-    const obj = modelObjectsRef.current.get(id);
-    if (obj && sceneRef.current) {
-      sceneRef.current.remove(obj);
-      modelObjectsRef.current.delete(id);
+    const groupObj = new THREE.Group();
+    groupObj.position.copy(centroid);
+    groupObj.userData.nodeId = groupId;
+    if (sceneRef.current) {
+      sceneRef.current.add(groupObj);
+      groupObj.updateMatrixWorld(true);
     }
-    const mixer = mixersRef.current.get(id);
-    if (mixer) {
-      mixer.stopAllAction();
-      mixersRef.current.delete(id);
+    modelObjectsRef.current.set(groupId, groupObj);
+
+    const nextNodes: SceneNode3D[] = [
+      ...currentNodes.map((n) => {
+        if (!rootSelected.includes(n.id)) return n;
+        const obj = modelObjectsRef.current.get(n.id);
+        if (obj) {
+          groupObj.attach(obj);
+          return {
+            ...n,
+            parentId: groupId,
+            position: [
+              Number(obj.position.x.toFixed(3)),
+              Number(obj.position.y.toFixed(3)),
+              Number(obj.position.z.toFixed(3)),
+            ] as [number, number, number],
+            rotation: [
+              Number(THREE.MathUtils.radToDeg(obj.rotation.x).toFixed(1)),
+              Number(THREE.MathUtils.radToDeg(obj.rotation.y).toFixed(1)),
+              Number(THREE.MathUtils.radToDeg(obj.rotation.z).toFixed(1)),
+            ] as [number, number, number],
+            scale: [
+              Number(obj.scale.x.toFixed(3)),
+              Number(obj.scale.y.toFixed(3)),
+              Number(obj.scale.z.toFixed(3)),
+            ] as [number, number, number],
+          };
+        }
+        return {
+          ...n,
+          parentId: groupId,
+          position: [
+            Number((n.position[0] - centroid.x).toFixed(3)),
+            Number((n.position[1] - centroid.y).toFixed(3)),
+            Number((n.position[2] - centroid.z).toFixed(3)),
+          ] as [number, number, number],
+        };
+      }),
+      groupNode,
+    ];
+
+    setNodes(nextNodes);
+    persistNodesToProject(nextNodes);
+    setSelectedIds([groupId]);
+    setExpandedNodeIds((prev) => ({ ...prev, [groupId]: true }));
+  }, [persistNodesToProject]);
+
+  // Ungroup a selected group node, preserving children world transforms
+  const handleUngroupSelected = useCallback(() => {
+    const targetId = primarySelectedId;
+    if (!targetId) return;
+    const grp = nodeMap.get(targetId);
+    if (!grp || grp.kind !== 'group') return;
+
+    const grpParentId = grp.parentId || null;
+    const grpParentObj = grpParentId
+      ? modelObjectsRef.current.get(grpParentId) || sceneRef.current
+      : sceneRef.current;
+
+    if (sceneRef.current) sceneRef.current.updateMatrixWorld(true);
+
+    const releasedChildIds: string[] = [];
+    const nextNodes = nodes
+      .filter((n) => n.id !== targetId)
+      .map((n) => {
+        if (n.parentId !== targetId) return n;
+        releasedChildIds.push(n.id);
+        const childObj = modelObjectsRef.current.get(n.id);
+        if (childObj && grpParentObj) {
+          grpParentObj.attach(childObj);
+          return {
+            ...n,
+            parentId: grpParentId,
+            position: [
+              Number(childObj.position.x.toFixed(3)),
+              Number(childObj.position.y.toFixed(3)),
+              Number(childObj.position.z.toFixed(3)),
+            ] as [number, number, number],
+            rotation: [
+              Number(THREE.MathUtils.radToDeg(childObj.rotation.x).toFixed(1)),
+              Number(THREE.MathUtils.radToDeg(childObj.rotation.y).toFixed(1)),
+              Number(THREE.MathUtils.radToDeg(childObj.rotation.z).toFixed(1)),
+            ] as [number, number, number],
+            scale: [
+              Number(childObj.scale.x.toFixed(3)),
+              Number(childObj.scale.y.toFixed(3)),
+              Number(childObj.scale.z.toFixed(3)),
+            ] as [number, number, number],
+          };
+        }
+        return { ...n, parentId: grpParentId };
+      });
+
+    const grpObj = modelObjectsRef.current.get(targetId);
+    if (grpObj) {
+      grpObj.parent?.remove(grpObj);
+      modelObjectsRef.current.delete(targetId);
     }
-    if (selectedId === id) {
-      setSelectedId(null);
+
+    setNodes(nextNodes);
+    persistNodesToProject(nextNodes);
+    setSelectedIds(releasedChildIds);
+  }, [primarySelectedId, nodeMap, nodes, persistNodesToProject]);
+
+  // Duplicate node(s)
+  const duplicateNodes = useCallback(
+    (idsToClone: string[]) => {
+      if (idsToClone.length === 0) return;
+      const newIds: string[] = [];
+      setNodes((prev) => {
+        const map = new Map<string, SceneNode3D>();
+        prev.forEach((n) => map.set(n.id, n));
+        const clones: SceneNode3D[] = [];
+
+        const cloneSubtree = (id: string, targetParentId: string | null, offset: boolean) => {
+          const orig = map.get(id);
+          if (!orig) return;
+          const nextId = `node_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+          if (offset) newIds.push(nextId);
+          clones.push({
+            ...orig,
+            id: nextId,
+            name: offset ? `${orig.name} (کپی)` : orig.name,
+            parentId: targetParentId,
+            position: offset
+              ? [
+                  Number((orig.position[0] + 0.9).toFixed(3)),
+                  orig.position[1],
+                  Number((orig.position[2] + 0.9).toFixed(3)),
+                ]
+              : [...orig.position],
+            rotation: [...orig.rotation],
+            scale: [...orig.scale],
+          });
+          prev
+            .filter((c) => c.parentId === id)
+            .forEach((child) => cloneSubtree(child.id, nextId, false));
+        };
+
+        const set = new Set(idsToClone);
+        const topLevel = idsToClone.filter((id) => {
+          let cur = map.get(id);
+          while (cur && cur.parentId) {
+            if (set.has(cur.parentId)) return false;
+            cur = map.get(cur.parentId);
+          }
+          return true;
+        });
+
+        topLevel.forEach((id) => {
+          const orig = map.get(id);
+          cloneSubtree(id, orig?.parentId ?? null, true);
+        });
+
+        const next = [...prev, ...clones];
+        persistNodesToProject(next);
+        return next;
+      });
+      if (newIds.length > 0) setSelectedIds(newIds);
+    },
+    [persistNodesToProject]
+  );
+
+  // Delete node(s) + all descendants cleanly
+  const deleteNodes = useCallback(
+    (idsToDelete: string[]) => {
+      if (idsToDelete.length === 0) return;
+      const toRemove = new Set<string>(idsToDelete);
+      let added = true;
+      while (added) {
+        added = false;
+        nodesRef.current.forEach((n) => {
+          if (n.parentId && toRemove.has(n.parentId) && !toRemove.has(n.id)) {
+            toRemove.add(n.id);
+            added = true;
+          }
+        });
+      }
+
+      toRemove.forEach((id) => {
+        const obj = modelObjectsRef.current.get(id);
+        if (obj) {
+          obj.parent?.remove(obj);
+          disposeObject3D(obj);
+          modelObjectsRef.current.delete(id);
+        }
+        const mixer = mixersRef.current.get(id);
+        if (mixer) {
+          mixer.stopAllAction();
+          mixersRef.current.delete(id);
+        }
+      });
+
       transformRef.current?.detach();
-    }
-    setNodes((prev) => prev.filter((n) => n.id !== id));
+      setSelectedIds((prev) => prev.filter((id) => !toRemove.has(id)));
+      setNodes((prev) => {
+        const next = prev.filter((n) => !toRemove.has(n.id));
+        persistNodesToProject(next);
+        return next;
+      });
+    },
+    [persistNodesToProject]
+  );
+
+  // Add Basic Primitive
+  const addPrimitiveNode = (primitiveType: Primitive3DType, label: string, color: string) => {
+    const count = nodes.filter((n) => n.primitiveType === primitiveType).length + 1;
+    const id = `node_prim_${primitiveType}_${Date.now()}_${Math.random().toString(36).slice(2, 4)}`;
+    const parentForNew =
+      selectedNode && selectedNode.kind === 'group' ? selectedNode.id : null;
+
+    const newNode: SceneNode3D = {
+      id,
+      name: `${label.split(' ')[0]} ${count}`,
+      kind: 'primitive',
+      primitiveType,
+      position: [
+        Number(((Math.random() - 0.5) * 3.5).toFixed(2)),
+        0,
+        Number(((Math.random() - 0.5) * 3.5).toFixed(2)),
+      ],
+      rotation: [0, 0, 0],
+      scale: [1, 1, 1],
+      color,
+      roughness: 0.4,
+      metalness: 0.25,
+      visible: true,
+      locked: false,
+      parentId: parentForNew,
+      layerId: 'props',
+    };
+    setNodes((prev) => {
+      const next = [...prev, newNode];
+      persistNodesToProject(next);
+      return next;
+    });
+    setSelectedIds([id]);
   };
 
-  // Group selected model into new group/folder
-  const handleGroupSelection = () => {
-    if (!selectedNode) return;
-    const folderName = prompt('نام گروه / پوشه جدید را وارد کنید:', 'گروه جدید');
-    if (!folderName) return;
-    updateNode(selectedNode.id, { folder: folderName });
-    setExpandedFolders((prev) => ({ ...prev, [folderName]: true }));
+  // Add PointLight
+  const addLightNode = () => {
+    const count = nodes.filter((n) => n.kind === 'light').length + 1;
+    const id = `node_light_${Date.now()}`;
+    const newNode: SceneNode3D = {
+      id,
+      name: `نور نقطه‌ای ${count}`,
+      kind: 'light',
+      position: [0, 3, 0],
+      rotation: [0, 0, 0],
+      scale: [1, 1, 1],
+      color: '#fbbf24',
+      lightIntensity: 4,
+      visible: true,
+      locked: false,
+      parentId: null,
+      layerId: 'lighting',
+    };
+    setNodes((prev) => {
+      const next = [...prev, newNode];
+      persistNodesToProject(next);
+      return next;
+    });
+    setSelectedIds([id]);
   };
 
-  // Add 3D Preset
-  const addPresetModel = (preset: Model3DPresetType, label: string) => {
+  // Add 3D Procedural Preset
+  const addPresetModel = (preset: Model3DPresetType, label: string, defaultColor: string) => {
     const count = nodes.filter((n) => n.preset === preset).length + 1;
-    const id = `node_${preset}_${Date.now()}`;
+    const id = `node_${preset}_${Date.now()}_${Math.random().toString(36).slice(2, 4)}`;
+    const parentForNew =
+      selectedNode && selectedNode.kind === 'group' ? selectedNode.id : null;
+
     const newNode: SceneNode3D = {
       id,
       name: `${label} ${count}`,
       kind: 'model-preset',
       preset,
-      position: [(Math.random() - 0.5) * 4, 0, (Math.random() - 0.5) * 4],
+      position: [
+        Number(((Math.random() - 0.5) * 4).toFixed(2)),
+        0,
+        Number(((Math.random() - 0.5) * 4).toFixed(2)),
+      ],
       rotation: [0, Math.round(Math.random() * 360), 0],
       scale: [1, 1, 1],
-      color: '#f59e0b',
+      color: defaultColor,
+      roughness: 0.42,
+      metalness: 0.25,
       visible: true,
       locked: false,
-      parentId: null,
+      parentId: parentForNew,
       layerId: 'props',
-      folder: 'آیتم‌ها',
     };
-    setNodes((prev) => [...prev, newNode]);
-    setSelectedId(id);
+    setNodes((prev) => {
+      const next = [...prev, newNode];
+      persistNodesToProject(next);
+      return next;
+    });
+    setSelectedIds([id]);
   };
 
-  // Handle uploaded 3D files (GLB, glTF, FBX, OBJ, STL, USD, USDZ)
+  // Spawn an existing project 3D asset from IndexedDB / project.assets
+  const spawnExistingAssetToScene = (asset: RayanAsset) => {
+    const id = `node_asset_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
+    const parentForNew =
+      selectedNode && selectedNode.kind === 'group' ? selectedNode.id : null;
+    const spawnX = Number(((Math.random() - 0.5) * 3).toFixed(2));
+    const spawnZ = Number(((Math.random() - 0.5) * 3).toFixed(2));
+
+    const newNode: SceneNode3D = {
+      id,
+      name: asset.name,
+      kind: 'model-asset',
+      assetId: asset.id,
+      format: asset.format.toUpperCase(),
+      position: [spawnX, 0, spawnZ],
+      rotation: [0, 0, 0],
+      scale: [1, 1, 1],
+      color: '#38bdf8',
+      visible: true,
+      locked: false,
+      parentId: parentForNew,
+      layerId: 'characters',
+      animations: asset.modelMeta?.animationNames,
+    };
+
+    setNodes((prev) => {
+      const next = [...prev, newNode];
+      persistNodesToProject(next);
+      return next;
+    });
+    setSelectedIds([id]);
+    if (orbitRef.current) {
+      orbitRef.current.target.set(spawnX, 0.75, spawnZ);
+    }
+  };
+
+  // Handle uploaded 3D files (GLB, glTF, FBX, OBJ, STL, USD, USDZ, PLY)
   const handleImport3DFiles = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
+    setImportError(null);
+    setImportStatus(null);
+
+    const addedNodeIds: string[] = [];
 
     for (const file of Array.from(files)) {
       const ext = file.name.split('.').pop()?.toLowerCase() || '';
       if (!['glb', 'gltf', 'fbx', 'obj', 'stl', 'usd', 'usdz', 'ply'].includes(ext)) {
+        setImportError(`فرمت فایل «${file.name}» مجاز نیست.`);
         continue;
       }
 
-      const dataUrl = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(String(reader.result || ''));
-        reader.onerror = () => reject(new Error('خطا در خواندن فایل'));
-        reader.readAsDataURL(file);
+      try {
+        setImportStatus(`در حال خواندن و بارگذاری «${file.name}»...`);
+        const buffer = await file.arrayBuffer();
+        if (!buffer || buffer.byteLength === 0) {
+          throw new Error('فایل خالی است.');
+        }
+
+        const format = ext as AssetFormat;
+        const mimeType =
+          format === 'glb'
+            ? 'model/gltf-binary'
+            : format === 'gltf'
+              ? 'model/gltf+json'
+              : 'application/octet-stream';
+        const dataUrl = arrayBufferToDataUrl(buffer, mimeType);
+
+        const parsed = await parseAndInspect3DModelFile(buffer, format, '#38bdf8');
+        const assetId = `asset_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        const assetName = file.name.replace(/\.[^.]+$/, '');
+
+        await saveAssetToDb({
+          id: assetId,
+          name: assetName,
+          kind: 'model3d',
+          format,
+          sizeBytes: file.size,
+          createdAt: Date.now(),
+          buffer,
+          dataUrl,
+          modelMeta: parsed.meta,
+        });
+
+        const newAsset: RayanAsset = {
+          id: assetId,
+          name: assetName,
+          kind: 'model3d',
+          format,
+          dataUrl,
+          sizeBytes: file.size,
+          createdAt: Date.now(),
+          modelMeta: parsed.meta,
+          storedInIdb: true,
+        };
+
+        await onAddAsset?.(newAsset);
+
+        const nodeId = `node_model_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
+        const spawnX = Number(((Math.random() - 0.5) * 3).toFixed(2));
+        const spawnZ = Number(((Math.random() - 0.5) * 3).toFixed(2));
+
+        const newNode: SceneNode3D = {
+          id: nodeId,
+          name: assetName,
+          kind: 'model-asset',
+          assetId,
+          format: ext.toUpperCase(),
+          position: [spawnX, 0, spawnZ],
+          rotation: [0, 0, 0],
+          scale: [1, 1, 1],
+          color: '#38bdf8',
+          visible: true,
+          locked: false,
+          parentId: null,
+          layerId: 'characters',
+          animations: parsed.meta.animationNames,
+        };
+
+        addedNodeIds.push(nodeId);
+        setNodes((prev) => {
+          const next = [...prev, newNode];
+          persistNodesToProject(next);
+          return next;
+        });
+
+        if (orbitRef.current) {
+          orbitRef.current.target.set(spawnX, 0.75, spawnZ);
+        }
+
+        setImportStatus(
+          `مدل «${assetName}» (${parsed.meta.vertexCount ?? 0} رأس) بارگذاری و ذخیره شد و به صحنه اضافه گردید.`
+        );
+      } catch (err) {
+        setImportStatus(null);
+        setImportError(
+          `خطا در بارگذاری مدل «${file.name}»: ${err instanceof Error ? err.message : 'فرمت یا ساختار نامعتبر'}`
+        );
+      }
+    }
+
+    if (addedNodeIds.length > 0) {
+      setSelectedIds(addedNodeIds);
+    }
+  };
+
+  // Save scene explicitly to IndexedDB
+  const handleExplicitSaveScene = () => {
+    persistNodesToProject(nodesRef.current, false);
+    setSaveFeedback(`صحنه با ${nodesRef.current.length} آبجکت در پروژه و IndexedDB ذخیره شد.`);
+    setTimeout(() => setSaveFeedback(null), 2600);
+  };
+
+  // Export composed multi-model scene to binary GLB
+  const handleExportSceneGLB = () => {
+    const scene = sceneRef.current;
+    if (!scene) return;
+    const exportRoot = new THREE.Group();
+    exportRoot.name = `${project.name || 'RayanScene'}`;
+
+    nodesRef.current
+      .filter((n) => !n.parentId || !nodeMap.has(n.parentId))
+      .forEach((rootNode) => {
+        const obj = modelObjectsRef.current.get(rootNode.id);
+        if (obj && rootNode.visible) {
+          exportRoot.add(obj.clone(true));
+        }
       });
 
-      let modelMeta = undefined;
-      if (ext === 'glb' || ext === 'gltf') {
-        try {
-          const buf = dataUrlToArrayBuffer(dataUrl);
-          const meta = await inspectGLTFMetadata(buf);
-          modelMeta = { format: ext as any, ...meta };
-        } catch {
-          // ignore inspection error
-        }
-      }
-
-      const assetId = `asset_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-      const newAsset: RayanAsset = {
-        id: assetId,
-        name: file.name.replace(/\.[^.]+$/, ''),
-        kind: 'model3d',
-        format: ext as any,
-        dataUrl,
-        sizeBytes: file.size,
-        createdAt: Date.now(),
-        modelMeta,
-      };
-
-      onAddAsset?.(newAsset);
-
-      // Add to 3D scene nodes
-      const nodeId = `node_model_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
-      const newNode: SceneNode3D = {
-        id: nodeId,
-        name: file.name.replace(/\.[^.]+$/, ''),
-        kind: 'model-asset',
-        assetId,
-        format: ext.toUpperCase(),
-        position: [(Math.random() - 0.5) * 3, 0, (Math.random() - 0.5) * 3],
-        rotation: [0, 0, 0],
-        scale: [1, 1, 1],
-        color: '#38bdf8',
-        visible: true,
-        locked: false,
-        parentId: null,
-        layerId: 'characters',
-        folder: 'مدل‌های وارد شده',
-        animations: modelMeta?.animationNames,
-      };
-
-      setNodes((prev) => [...prev, newNode]);
-      setSelectedId(nodeId);
-      setExpandedFolders((prev) => ({ ...prev, 'مدل‌های وارد شده': true }));
+    if (exportRoot.children.length === 0) {
+      setImportError('هیچ مدل فعالی برای خروجی گرفتن در صحنه وجود ندارد.');
+      return;
     }
+
+    const exporter = new GLTFExporter();
+    exporter.parse(
+      exportRoot,
+      (result) => {
+        if (result instanceof ArrayBuffer) {
+          const blob = new Blob([result], { type: 'model/gltf-binary' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `${(project.name || 'rayan-scene').replace(/\s+/g, '_')}.glb`;
+          a.click();
+          URL.revokeObjectURL(url);
+          setSaveFeedback('خروجی سه‌بعدی GLB کل صحنه با موفقیت تولید و دانلود شد.');
+          setTimeout(() => setSaveFeedback(null), 2600);
+        }
+      },
+      (err) => {
+        setImportError(`خطا در خروجی GLB: ${err instanceof Error ? err.message : String(err)}`);
+      },
+      { binary: true }
+    );
+  };
+
+  // Align selected objects along X or Y=0 or Z
+  const handleAlignSelected = (axis: 'ground' | 'centerX' | 'centerZ') => {
+    if (selectedIds.length === 0) return;
+    setNodes((prev) => {
+      const next = prev.map((n) => {
+        if (!selectedIds.includes(n.id)) return n;
+        const pos: [number, number, number] = [...n.position];
+        if (axis === 'ground') pos[1] = 0;
+        if (axis === 'centerX') pos[0] = 0;
+        if (axis === 'centerZ') pos[2] = 0;
+        const obj = modelObjectsRef.current.get(n.id);
+        if (obj) obj.position.set(...pos);
+        return { ...n, position: pos };
+      });
+      persistNodesToProject(next);
+      return next;
+    });
   };
 
   // --- Main Three.js Scene Initialization ---
@@ -358,63 +1203,78 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
     const width = container.clientWidth || 800;
     const height = container.clientHeight || 600;
 
-    // 1. Scene & Background
+    const isSoftwareGl = (() => {
+      try {
+        const c = document.createElement('canvas');
+        const gl = c.getContext('webgl2');
+        if (!gl) return true;
+        const ext = gl.getExtension('WEBGL_debug_renderer_info');
+        const param = ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER;
+        const gpu = String(gl.getParameter(param));
+        gl.getExtension('WEBGL_lose_context')?.loseContext();
+        return /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
+      } catch {
+        return true;
+      }
+    })();
+
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x0b0e14);
-    scene.fog = new THREE.FogExp2(0x0b0e14, 0.02);
+    scene.fog = new THREE.FogExp2(0x0b0e14, 0.018);
     sceneRef.current = scene;
 
-    // 2. Camera
     const camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 1000);
-    camera.position.set(6, 5, 8);
+    camera.position.set(7, 5.5, 9);
     cameraRef.current = camera;
 
-    // 3. Renderer with SRGB and Tone Mapping
-    const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+    const renderer = new THREE.WebGLRenderer({
+      antialias: !isSoftwareGl,
+      powerPreference: 'high-performance',
+    });
     renderer.setSize(width, height);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setPixelRatio(isSoftwareGl ? 1 : Math.min(window.devicePixelRatio, 2));
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.1;
-    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.enabled = !isSoftwareGl;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     rendererRef.current = renderer;
     container.appendChild(renderer.domElement);
 
-    // 4. Studio Environment Lighting (RoomEnvironment)
+    // Studio Environment Lighting
     const pmrem = new THREE.PMREMGenerator(renderer);
     scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
     pmrem.dispose();
 
-    // 5. 3-Point Studio Lighting Rig
+    // 3-Point Studio Lighting Rig
     const hemiLight = new THREE.HemisphereLight(0xe0f2fe, 0x0f172a, 0.7);
     scene.add(hemiLight);
 
     const dirLight = new THREE.DirectionalLight(0xfffbeb, 1.4);
     dirLight.position.set(8, 12, 6);
-    dirLight.castShadow = true;
+    dirLight.castShadow = !isSoftwareGl;
     dirLight.shadow.mapSize.width = 2048;
     dirLight.shadow.mapSize.height = 2048;
     dirLight.shadow.bias = -0.0005;
     dirLight.shadow.normalBias = 0.02;
     dirLight.shadow.camera.near = 0.5;
-    dirLight.shadow.camera.far = 40;
-    dirLight.shadow.camera.left = -10;
-    dirLight.shadow.camera.right = 10;
-    dirLight.shadow.camera.top = 10;
-    dirLight.shadow.camera.bottom = -10;
+    dirLight.shadow.camera.far = 45;
+    dirLight.shadow.camera.left = -12;
+    dirLight.shadow.camera.right = 12;
+    dirLight.shadow.camera.top = 12;
+    dirLight.shadow.camera.bottom = -12;
     scene.add(dirLight);
 
-    const fillLight = new THREE.DirectionalLight(0x38bdf8, 0.4);
+    const fillLight = new THREE.DirectionalLight(0x38bdf8, 0.45);
     fillLight.position.set(-8, 6, -6);
     scene.add(fillLight);
 
-    // 6. Ground Grid & Contact Floor
-    const grid = new THREE.GridHelper(30, 30, 0x38bdf8, 0x1e293b);
+    // Ground Grid & Floor
+    const grid = new THREE.GridHelper(40, 40, 0x38bdf8, 0x1e293b);
     grid.position.y = 0;
     scene.add(grid);
 
-    const floorGeo = new THREE.PlaneGeometry(60, 60);
+    const floorGeo = new THREE.PlaneGeometry(80, 80);
     const floorMat = new THREE.MeshStandardMaterial({
       color: 0x090c12,
       roughness: 0.9,
@@ -422,11 +1282,22 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
     });
     const floor = new THREE.Mesh(floorGeo, floorMat);
     floor.rotation.x = -Math.PI / 2;
-    floor.position.y = -0.01;
+    floor.position.y = -0.015;
     floor.receiveShadow = true;
     scene.add(floor);
 
-    // 7. Controls: TransformControls (constructed first) and OrbitControls
+    // Multi-selection pivot & BoxHelpers container
+    const multiPivot = new THREE.Group();
+    multiPivot.name = '__RayanMultiPivot__';
+    scene.add(multiPivot);
+    multiPivotRef.current = multiPivot;
+
+    const selectionHelpers = new THREE.Group();
+    selectionHelpers.name = '__RayanSelectionHelpers__';
+    scene.add(selectionHelpers);
+    selectionHelpersRef.current = selectionHelpers;
+
+    // Controls
     const transformCtrl = new TransformControls(camera, renderer.domElement);
     transformCtrl.setMode('translate');
     transformCtrl.setSize(0.85);
@@ -434,56 +1305,161 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
     transformRef.current = transformCtrl;
 
     const orbitCtrl = new OrbitControls(camera, renderer.domElement);
-    orbitCtrl.enableDamping = true;
+    orbitCtrl.enableDamping = !isSoftwareGl;
     orbitCtrl.dampingFactor = 0.05;
     orbitCtrl.maxPolarAngle = Math.PI / 2 - 0.02;
     orbitCtrl.minDistance = 1;
-    orbitCtrl.maxDistance = 50;
+    orbitCtrl.maxDistance = 60;
     orbitCtrl.target.set(0, 0.8, 0);
     orbitRef.current = orbitCtrl;
 
-    // Orbit/Transform collision avoidance
+    // TransformControls dragging-changed: disable OrbitControls + capture/commit multi-object transforms
     transformCtrl.addEventListener('dragging-changed', (event) => {
-      orbitCtrl.enabled = !event.value;
+      const isDragging = Boolean(event.value);
+      orbitCtrl.enabled = !isDragging;
+
+      if (isDragging && transformCtrl.object === multiPivot) {
+        scene.updateMatrixWorld(true);
+        const pivotStartInv = multiPivot.matrixWorld.clone().invert();
+        const currentMap = new Map<string, SceneNode3D>();
+        nodesRef.current.forEach((n) => currentMap.set(n.id, n));
+
+        const selectedSet = new Set(selectedIdsRef.current);
+        const items: MultiDragSnapshot['items'] = [];
+
+        selectedIdsRef.current.forEach((id) => {
+          const n = currentMap.get(id);
+          if (!n || isEffectiveLocked(id, currentMap)) return;
+          // Skip child if ancestor is also selected
+          let cur: SceneNode3D | undefined = n;
+          while (cur && cur.parentId) {
+            if (selectedSet.has(cur.parentId)) return;
+            cur = currentMap.get(cur.parentId);
+          }
+          const obj = modelObjectsRef.current.get(id);
+          if (!obj) return;
+          const parentWorldInv = obj.parent
+            ? obj.parent.matrixWorld.clone().invert()
+            : new THREE.Matrix4().identity();
+          items.push({
+            nodeId: id,
+            obj,
+            worldStart: obj.matrixWorld.clone(),
+            parentWorldInv,
+          });
+        });
+
+        multiDragSnapshotRef.current = { pivotStartInv, items };
+      } else if (!isDragging) {
+        multiDragSnapshotRef.current = null;
+        setNodes((latest) => {
+          persistNodesToProject(latest);
+          return latest;
+        });
+      }
     });
 
-    // Update node transform when gizmo is moved
+    // Update node transform(s) while gizmo moves
     transformCtrl.addEventListener('objectChange', () => {
-      const obj = transformCtrl.object;
-      if (!obj || !obj.userData.nodeId) return;
-      const id = obj.userData.nodeId;
-      setNodes((prev) =>
-        prev.map((n) => {
-          if (n.id !== id) return n;
-          return {
-            ...n,
+      const targetObj = transformCtrl.object;
+      if (!targetObj) return;
+
+      if (targetObj === multiPivot && multiDragSnapshotRef.current) {
+        multiPivot.updateMatrixWorld(true);
+        const snap = multiDragSnapshotRef.current;
+        _tmpMatA.multiplyMatrices(multiPivot.matrixWorld, snap.pivotStartInv);
+
+        const updates = new Map<
+          string,
+          {
+            position: [number, number, number];
+            rotation: [number, number, number];
+            scale: [number, number, number];
+          }
+        >();
+
+        for (const item of snap.items) {
+          _tmpMatB.multiplyMatrices(_tmpMatA, item.worldStart);
+          _tmpMatB.premultiply(item.parentWorldInv);
+          _tmpMatB.decompose(_tmpVec, _tmpQuat, _tmpScale);
+
+          item.obj.position.copy(_tmpVec);
+          item.obj.quaternion.copy(_tmpQuat);
+          item.obj.scale.copy(_tmpScale);
+          item.obj.updateMatrixWorld(true);
+
+          _tmpEuler.setFromQuaternion(_tmpQuat, 'XYZ');
+          updates.set(item.nodeId, {
             position: [
-              Number(obj.position.x.toFixed(3)),
-              Number(obj.position.y.toFixed(3)),
-              Number(obj.position.z.toFixed(3)),
+              Number(_tmpVec.x.toFixed(3)),
+              Number(_tmpVec.y.toFixed(3)),
+              Number(_tmpVec.z.toFixed(3)),
             ],
             rotation: [
-              Number(THREE.MathUtils.radToDeg(obj.rotation.x).toFixed(1)),
-              Number(THREE.MathUtils.radToDeg(obj.rotation.y).toFixed(1)),
-              Number(THREE.MathUtils.radToDeg(obj.rotation.z).toFixed(1)),
+              Number(THREE.MathUtils.radToDeg(_tmpEuler.x).toFixed(1)),
+              Number(THREE.MathUtils.radToDeg(_tmpEuler.y).toFixed(1)),
+              Number(THREE.MathUtils.radToDeg(_tmpEuler.z).toFixed(1)),
             ],
             scale: [
-              Number(obj.scale.x.toFixed(3)),
-              Number(obj.scale.y.toFixed(3)),
-              Number(obj.scale.z.toFixed(3)),
+              Number(_tmpScale.x.toFixed(3)),
+              Number(_tmpScale.y.toFixed(3)),
+              Number(_tmpScale.z.toFixed(3)),
             ],
-          };
-        })
-      );
+          });
+        }
+
+        if (updates.size > 0) {
+          setNodes((prev) =>
+            prev.map((n) => {
+              const patch = updates.get(n.id);
+              return patch ? { ...n, ...patch } : n;
+            })
+          );
+        }
+        return;
+      }
+
+      if (targetObj.userData?.nodeId) {
+        const id = targetObj.userData.nodeId as string;
+        setNodes((prev) =>
+          prev.map((n) => {
+            if (n.id !== id) return n;
+            return {
+              ...n,
+              position: [
+                Number(targetObj.position.x.toFixed(3)),
+                Number(targetObj.position.y.toFixed(3)),
+                Number(targetObj.position.z.toFixed(3)),
+              ],
+              rotation: [
+                Number(THREE.MathUtils.radToDeg(targetObj.rotation.x).toFixed(1)),
+                Number(THREE.MathUtils.radToDeg(targetObj.rotation.y).toFixed(1)),
+                Number(THREE.MathUtils.radToDeg(targetObj.rotation.z).toFixed(1)),
+              ],
+              scale: [
+                Number(targetObj.scale.x.toFixed(3)),
+                Number(targetObj.scale.y.toFixed(3)),
+                Number(targetObj.scale.z.toFixed(3)),
+              ],
+            };
+          })
+        );
+      }
     });
 
-    // 8. Raycasting on Viewport Click to Select Model Independently
+    // Raycasting on Viewport Click for Independent & Multi-Object Selection
     const raycaster = new THREE.Raycaster();
     const pointer = new THREE.Vector2();
+    let downPos = { x: 0, y: 0 };
 
-    const onPointerDown = (e: MouseEvent) => {
-      // Ignore if user clicked on TransformControls gizmo
+    const onPointerDown = (e: PointerEvent) => {
+      downPos = { x: e.clientX, y: e.clientY };
+    };
+
+    const onPointerUp = (e: PointerEvent) => {
       if (transformCtrl.dragging) return;
+      const movedDist = Math.hypot(e.clientX - downPos.x, e.clientY - downPos.y);
+      if (movedDist > 5) return; // Ignore camera orbit drags
 
       const rect = renderer.domElement.getBoundingClientRect();
       pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
@@ -491,7 +1467,6 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
 
       raycaster.setFromCamera(pointer, camera);
 
-      // Intersect all model objects
       const candidates: THREE.Object3D[] = [];
       modelObjectsRef.current.forEach((obj) => {
         if (obj.visible) candidates.push(obj);
@@ -504,36 +1479,53 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
           cur = cur.parent;
         }
         if (cur && cur.userData.nodeId) {
-          setSelectedId(cur.userData.nodeId);
+          const hitId = cur.userData.nodeId as string;
+          if (e.ctrlKey || e.metaKey || e.shiftKey) {
+            setSelectedIds((prev) =>
+              prev.includes(hitId) ? prev.filter((id) => id !== hitId) : [...prev, hitId]
+            );
+          } else {
+            setSelectedIds([hitId]);
+          }
+          return;
         }
+      }
+
+      if (!e.ctrlKey && !e.metaKey && !e.shiftKey) {
+        setSelectedIds([]);
       }
     };
 
     renderer.domElement.addEventListener('pointerdown', onPointerDown);
+    renderer.domElement.addEventListener('pointerup', onPointerUp);
 
-    // 9. Resize Observer
+    // Resize Observer
     const ro = new ResizeObserver(() => {
       if (!container) return;
       const w = container.clientWidth;
       const h = container.clientHeight;
+      if (w === 0 || h === 0) return;
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
     });
     ro.observe(container);
 
-    // 10. Animation Tick Loop
+    // Animation & BoxHelper Tick Loop
     let animId = 0;
     const animate = () => {
       animId = requestAnimationFrame(animate);
       const dt = clockRef.current.getDelta();
 
-      // Update animation mixers
-      if (isPlayingAnimations) {
+      if (isPlayingAnimRef.current) {
         mixersRef.current.forEach((mixer) => {
-          mixer.update(dt * animSpeed);
+          mixer.update(dt * animSpeedRef.current);
         });
       }
+
+      boxHelpersMapRef.current.forEach((helper) => {
+        helper.update();
+      });
 
       orbitCtrl.update();
       renderer.render(scene, camera);
@@ -544,30 +1536,39 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
       cancelAnimationFrame(animId);
       ro.disconnect();
       renderer.domElement.removeEventListener('pointerdown', onPointerDown);
+      renderer.domElement.removeEventListener('pointerup', onPointerUp);
       transformCtrl.dispose();
       orbitCtrl.dispose();
+      floorGeo.dispose();
+      floorMat.dispose();
+      modelObjectsRef.current.forEach((obj) => disposeObject3D(obj));
+      modelObjectsRef.current.clear();
+      boxHelpersMapRef.current.forEach((h) => h.dispose());
+      boxHelpersMapRef.current.clear();
       renderer.dispose();
       if (renderer.domElement.parentElement) {
         renderer.domElement.parentElement.removeChild(renderer.domElement);
       }
     };
-  }, []);
+  }, [persistNodesToProject]);
 
-  // --- Sync Three.js Objects when `nodes` state changes ---
+  // --- Sync Three.js Scene Graph Objects & Parent/Child Hierarchy ---
   useEffect(() => {
     const scene = sceneRef.current;
     if (!scene) return;
 
     let isCancelled = false;
 
-    // Load and place every node into the 3D scene
     const syncNodes = async () => {
       const activeIds = new Set(nodes.map((n) => n.id));
+      const currentMap = new Map<string, SceneNode3D>();
+      nodes.forEach((n) => currentMap.set(n.id, n));
 
-      // Remove deleted nodes from Three.js scene
+      // 1. Remove deleted nodes & dispose GPU resources
       modelObjectsRef.current.forEach((obj, id) => {
         if (!activeIds.has(id)) {
-          scene.remove(obj);
+          obj.parent?.remove(obj);
+          disposeObject3D(obj);
           modelObjectsRef.current.delete(id);
           const mixer = mixersRef.current.get(id);
           if (mixer) {
@@ -577,36 +1578,57 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
         }
       });
 
+      // 2. Build missing Three.js objects for every node
       for (const node of nodes) {
         if (isCancelled) return;
-
         let obj = modelObjectsRef.current.get(node.id);
 
         if (!obj) {
-          // Build new 3D model (Asset or Preset)
-          if (node.kind === 'model-asset' && node.assetId) {
-            const asset = project.assets.find((a) => a.id === node.assetId);
-            if (asset) {
-              try {
-                obj = await loadCustom3DAsset(asset, node.color);
-              } catch {
-                obj = buildProceduralPresetGroup('crate', node.color);
-              }
-            } else {
-              obj = buildProceduralPresetGroup('crate', node.color);
+          if (node.kind === 'group') {
+            obj = new THREE.Group();
+          } else if (node.kind === 'light') {
+            obj = buildLight3DGroup(node.color, node.lightIntensity ?? 4);
+          } else if (node.kind === 'primitive') {
+            obj = buildPrimitive3DGroup(
+              node.primitiveType || 'box',
+              node.color,
+              node.roughness ?? 0.4,
+              node.metalness ?? 0.25
+            );
+          } else if (node.kind === 'model-asset' && node.assetId) {
+            const asset: RayanAsset = project.assets.find((a) => a.id === node.assetId) || {
+              id: node.assetId,
+              name: node.name,
+              kind: 'model3d',
+              format: (node.format?.toLowerCase() || 'glb') as AssetFormat,
+              dataUrl: `idb://${node.assetId}`,
+              sizeBytes: 0,
+              createdAt: 0,
+              storedInIdb: true,
+            };
+            try {
+              obj = await loadCustom3DAsset(asset, node.color);
+            } catch (err) {
+              setImportError(
+                `خطا در رندر مدل «${node.name}»: ${err instanceof Error ? err.message : 'فایل سه‌بعدی نامعتبر است'}`
+              );
+              continue;
             }
           } else {
             obj = buildProceduralPresetGroup(node.preset || 'crate', node.color);
           }
 
-          if (isCancelled) return;
+          if (isCancelled) {
+            disposeObject3D(obj);
+            return;
+          }
 
+          obj.name = node.name;
           obj.userData.nodeId = node.id;
           obj.traverse((child) => {
             child.userData.nodeId = node.id;
           });
 
-          // Check and play animations if present
           if (obj.userData.animations && obj.userData.animations.length > 0) {
             const mixer = new THREE.AnimationMixer(obj);
             obj.userData.animations.forEach((clip: THREE.AnimationClip) => {
@@ -616,19 +1638,46 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
           }
 
           modelObjectsRef.current.set(node.id, obj);
-          scene.add(obj);
+        }
+      }
+
+      if (isCancelled) return;
+
+      // 3. Reconstruct true Parent-Child hierarchy & apply local transforms
+      for (const node of nodes) {
+        const obj = modelObjectsRef.current.get(node.id);
+        if (!obj) continue;
+
+        const validParentId =
+          node.parentId &&
+          node.parentId !== node.id &&
+          modelObjectsRef.current.has(node.parentId) &&
+          !isDescendantOf(node.parentId, node.id, currentMap)
+            ? node.parentId
+            : null;
+
+        const desiredParent: THREE.Object3D = validParentId
+          ? modelObjectsRef.current.get(validParentId)!
+          : scene;
+
+        if (obj.parent !== desiredParent) {
+          desiredParent.add(obj);
         }
 
-        // Apply transforms and visibility
-        obj.position.set(...node.position);
-        obj.rotation.set(
-          THREE.MathUtils.degToRad(node.rotation[0]),
-          THREE.MathUtils.degToRad(node.rotation[1]),
-          THREE.MathUtils.degToRad(node.rotation[2])
-        );
-        obj.scale.set(...node.scale);
+        if (!transformRef.current?.dragging) {
+          obj.position.set(...node.position);
+          obj.rotation.set(
+            THREE.MathUtils.degToRad(node.rotation[0]),
+            THREE.MathUtils.degToRad(node.rotation[1]),
+            THREE.MathUtils.degToRad(node.rotation[2])
+          );
+          obj.scale.set(...node.scale);
+        }
         obj.visible = node.visible;
+        obj.name = node.name;
       }
+
+      syncTransformGizmoAttachment();
     };
 
     void syncNodes();
@@ -636,59 +1685,267 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
     return () => {
       isCancelled = true;
     };
-  }, [nodes, project.assets]);
+  }, [nodes, project.assets, syncTransformGizmoAttachment]);
 
-  // --- Attach / Detach TransformControls based on Selection ---
+  // --- Sync Selection BoxHelpers & TransformControls Attachment ---
   useEffect(() => {
-    const tc = transformRef.current;
-    if (!tc) return;
+    const helpersGroup = selectionHelpersRef.current;
+    if (helpersGroup) {
+      const selectedSet = new Set(selectedIds);
+      // Remove stale helpers
+      boxHelpersMapRef.current.forEach((helper, id) => {
+        if (!selectedSet.has(id) || !modelObjectsRef.current.has(id)) {
+          helpersGroup.remove(helper);
+          helper.dispose();
+          boxHelpersMapRef.current.delete(id);
+        }
+      });
 
-    if (!selectedId) {
-      tc.detach();
-      return;
+      // Add or color helpers for every selected object
+      selectedIds.forEach((id, idx) => {
+        const obj = modelObjectsRef.current.get(id);
+        if (!obj) return;
+        const isPrimary = idx === selectedIds.length - 1;
+        const hex = isPrimary ? 0x38bdf8 : 0xfbbf24;
+        let helper = boxHelpersMapRef.current.get(id);
+        if (!helper) {
+          helper = new THREE.BoxHelper(obj, hex);
+          helpersGroup.add(helper);
+          boxHelpersMapRef.current.set(id, helper);
+        } else {
+          (helper.material as THREE.LineBasicMaterial).color.setHex(hex);
+          helper.update();
+        }
+      });
     }
 
-    const node = nodes.find((n) => n.id === selectedId);
-    if (!node || node.locked || !node.visible) {
-      tc.detach();
-      return;
-    }
+    syncTransformGizmoAttachment();
+  }, [selectedIds, nodes, syncTransformGizmoAttachment]);
 
-    const obj = modelObjectsRef.current.get(selectedId);
-    if (obj) {
-      tc.attach(obj);
-    } else {
-      tc.detach();
-    }
-  }, [selectedId, nodes]);
-
-  // Keyboard hotkeys for Transform Modes (W = Translate, E = Rotate, R = Scale)
+  // Keyboard hotkeys (W, E, R, F, Delete, Ctrl+G, Ctrl+D, Escape)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
-
-      if (e.key.toLowerCase() === 'w') setTransformMode('translate');
-      if (e.key.toLowerCase() === 'e') setTransformMode('rotate');
-      if (e.key.toLowerCase() === 'r') setTransformMode('scale');
-      if (e.key.toLowerCase() === 'f' && selectedNode) {
-        // Focus camera on selected object
-        const obj = modelObjectsRef.current.get(selectedNode.id);
-        if (obj && orbitRef.current) {
-          orbitRef.current.target.copy(obj.position);
-        }
+      if (
+        e.target instanceof HTMLInputElement ||
+        e.target instanceof HTMLTextAreaElement ||
+        e.target instanceof HTMLSelectElement
+      ) {
+        return;
       }
-      if (e.key === 'Delete' && selectedId) {
-        deleteNode(selectedId);
+
+      const key = e.key.toLowerCase();
+      if (key === 'w') setTransformMode('translate');
+      else if (key === 'e') setTransformMode('rotate');
+      else if (key === 'r') setTransformMode('scale');
+      else if (key === 'escape') setSelectedIds([]);
+      else if ((e.ctrlKey || e.metaKey) && key === 'g') {
+        e.preventDefault();
+        if (e.shiftKey) handleUngroupSelected();
+        else handleGroupSelected();
+      } else if ((e.ctrlKey || e.metaKey) && key === 'd' && selectedIdsRef.current.length > 0) {
+        e.preventDefault();
+        duplicateNodes(selectedIdsRef.current);
+      } else if (key === 'f' && primarySelectedId) {
+        const obj = modelObjectsRef.current.get(primarySelectedId);
+        if (obj && orbitRef.current && sceneRef.current) {
+          sceneRef.current.updateMatrixWorld(true);
+          obj.getWorldPosition(_tmpVec);
+          orbitRef.current.target.copy(_tmpVec);
+        }
+      } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedIdsRef.current.length > 0) {
+        e.preventDefault();
+        deleteNodes(selectedIdsRef.current);
       }
     };
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [selectedId, selectedNode]);
+  }, [primarySelectedId, handleGroupSelected, handleUngroupSelected, duplicateNodes, deleteNodes]);
+
+  // Handle Tree Row Click (single, Ctrl/Cmd toggle, Shift range)
+  const handleTreeRowClick = (e: React.MouseEvent, nodeId: string) => {
+    if (e.shiftKey && primarySelectedId) {
+      const startIdx = flattenedTreeIds.indexOf(primarySelectedId);
+      const endIdx = flattenedTreeIds.indexOf(nodeId);
+      if (startIdx !== -1 && endIdx !== -1) {
+        const [from, to] = startIdx < endIdx ? [startIdx, endIdx] : [endIdx, startIdx];
+        const rangeIds = flattenedTreeIds.slice(from, to + 1);
+        setSelectedIds((prev) => Array.from(new Set([...prev, ...rangeIds])));
+        return;
+      }
+    }
+    if (e.ctrlKey || e.metaKey) {
+      setSelectedIds((prev) =>
+        prev.includes(nodeId) ? prev.filter((id) => id !== nodeId) : [...prev, nodeId]
+      );
+      return;
+    }
+    setSelectedIds([nodeId]);
+  };
+
+  // Recursive Tree Node Renderer
+  const renderHierarchyNode = (node: SceneNode3D, depth = 0): React.ReactNode => {
+    const children = childrenByParent.get(node.id) || [];
+    const hasChildren = children.length > 0 || node.kind === 'group';
+    const isExpanded = expandedNodeIds[node.id] ?? true;
+    const isSelected = selectedIds.includes(node.id);
+    const effLocked = isEffectiveLocked(node.id, nodeMap);
+
+    const q = searchQuery.trim().toLowerCase();
+    const matchesSelf =
+      !q ||
+      node.name.toLowerCase().includes(q) ||
+      (node.format && node.format.toLowerCase().includes(q));
+    const hasMatchDescendant = (id: string): boolean => {
+      const ch = childrenByParent.get(id) || [];
+      return ch.some(
+        (c) =>
+          c.name.toLowerCase().includes(q) ||
+          (c.format && c.format.toLowerCase().includes(q)) ||
+          hasMatchDescendant(c.id)
+      );
+    };
+    if (q && !matchesSelf && !hasMatchDescendant(node.id)) return null;
+
+    return (
+      <div key={node.id} className="space-y-0.5">
+        <div
+          draggable
+          onDragStart={(e) => {
+            e.stopPropagation();
+            setDraggedNodeId(node.id);
+            e.dataTransfer.setData('text/plain', node.id);
+          }}
+          onDragOver={(e) => {
+            if (draggedNodeId && draggedNodeId !== node.id) {
+              e.preventDefault();
+            }
+          }}
+          onDrop={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (draggedNodeId && draggedNodeId !== node.id) {
+              reparentNode(draggedNodeId, node.id);
+            }
+            setDraggedNodeId(null);
+          }}
+          onDragEnd={() => setDraggedNodeId(null)}
+          onClick={(e) => handleTreeRowClick(e, node.id)}
+          style={{ paddingRight: `${8 + depth * 14}px` }}
+          className={`group flex items-center justify-between gap-1 pl-1.5 py-1.5 rounded-lg text-xs cursor-pointer transition-colors ${
+            isSelected
+              ? 'bg-sky-500/20 border border-sky-500/45 text-sky-100'
+              : 'border border-transparent text-slate-300 hover:bg-slate-800/70'
+          }`}
+        >
+          <div className="flex items-center gap-1 min-w-0 flex-1">
+            {hasChildren ? (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setExpandedNodeIds((prev) => ({ ...prev, [node.id]: !isExpanded }));
+                }}
+                className="p-0.5 text-slate-400 hover:text-slate-100 shrink-0"
+              >
+                {isExpanded ? (
+                  <ChevronDown className="w-3 h-3" />
+                ) : (
+                  <ChevronRight className="w-3 h-3" />
+                )}
+              </button>
+            ) : (
+              <span className="w-4 shrink-0" />
+            )}
+
+            {node.kind === 'group' ? (
+              <Folder className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+            ) : node.kind === 'light' ? (
+              <Lightbulb className="w-3.5 h-3.5 text-yellow-300 shrink-0" />
+            ) : node.kind === 'primitive' ? (
+              <Shapes className="w-3.5 h-3.5 shrink-0" style={{ color: node.color }} />
+            ) : (
+              <Box className="w-3.5 h-3.5 shrink-0" style={{ color: node.color }} />
+            )}
+
+            <span className="truncate font-medium">{node.name}</span>
+
+            {node.format && (
+              <span className="text-[9px] font-mono px-1 rounded bg-slate-800 text-slate-400 shrink-0">
+                {node.format}
+              </span>
+            )}
+          </div>
+
+          <div className="flex items-center gap-0.5 shrink-0">
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                updateNode(node.id, { visible: !node.visible }, true);
+              }}
+              className="p-1 text-slate-400 hover:text-slate-100"
+              title={node.visible ? 'پنهان کردن' : 'نمایش دادن'}
+            >
+              {node.visible ? (
+                <Eye className="w-3 h-3 text-emerald-400" />
+              ) : (
+                <EyeOff className="w-3 h-3 text-slate-500" />
+              )}
+            </button>
+
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                updateNode(node.id, { locked: !node.locked }, true);
+              }}
+              className="p-1 text-slate-400 hover:text-slate-100"
+              title={effLocked ? 'قفل شده' : 'قفل کردن'}
+            >
+              {node.locked ? (
+                <Lock className="w-3 h-3 text-amber-400" />
+              ) : (
+                <Unlock className="w-3 h-3 text-slate-500 opacity-0 group-hover:opacity-100" />
+              )}
+            </button>
+
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                duplicateNodes([node.id]);
+              }}
+              className="p-1 text-slate-500 hover:text-sky-300 opacity-0 group-hover:opacity-100"
+              title="کپی"
+            >
+              <Copy className="w-3 h-3" />
+            </button>
+
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                deleteNodes([node.id]);
+              }}
+              className="p-1 text-slate-500 hover:text-red-400 opacity-0 group-hover:opacity-100"
+              title="حذف"
+            >
+              <Trash2 className="w-3 h-3" />
+            </button>
+          </div>
+        </div>
+
+        {isExpanded && children.length > 0 && (
+          <div className="space-y-0.5">{children.map((ch) => renderHierarchyNode(ch, depth + 1))}</div>
+        )}
+      </div>
+    );
+  };
 
   return (
     <div className="flex-1 flex flex-col lg:flex-row h-full w-full bg-[#0B0E14] text-slate-100 overflow-hidden select-none">
-      {/* Hidden File Input for 3D Format Imports */}
+      {/* Hidden File Input for 3D Formats */}
       <input
         ref={fileInputRef}
         type="file"
@@ -701,26 +1958,25 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
         }}
       />
 
-      {/* Left / Primary Sidebar: Scene Hierarchy Tree Panel */}
-      <aside className="w-full lg:w-80 h-72 lg:h-full shrink-0 border-b lg:border-b-0 lg:border-l border-slate-800 bg-[#0E121B] flex flex-col overflow-hidden">
-        {/* Header */}
+      {/* Left Sidebar: Real Scene Hierarchy Tree + Creation Palette */}
+      <aside className="w-full lg:w-84 h-80 lg:h-full shrink-0 border-b lg:border-b-0 lg:border-l border-slate-800 bg-[#0E121B] flex flex-col overflow-hidden">
         <div className="p-3 border-b border-slate-800/80 bg-[#121723] flex items-center justify-between">
           <div className="flex items-center gap-2">
             <FolderTree className="w-4 h-4 text-sky-400" />
-            <h2 className="text-xs font-bold text-slate-100">سلسله‌مراتب صحنه سه‌بعدی</h2>
+            <h2 className="text-xs font-bold text-slate-100">سلسله‌مراتب صحنه (Hierarchy)</h2>
           </div>
           <span className="text-[11px] font-mono text-slate-400 tabular-nums">
-            {nodes.length} مدل
+            {nodes.length} گره
           </span>
         </div>
 
-        {/* Toolbar in Hierarchy: Add, Search, Group */}
+        {/* Search + Actions */}
         <div className="p-2 border-b border-slate-800 space-y-2 bg-[#10141F]">
           <div className="relative">
             <Search className="w-3.5 h-3.5 absolute right-2.5 top-2.5 text-slate-500" />
             <input
               type="text"
-              placeholder="جستجو در مدل‌ها و لایه‌ها..."
+              placeholder="جستجو در گره‌ها، گروه‌ها و فرمت‌ها..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               className="w-full pl-2 pr-8 py-1.5 rounded-lg bg-[#080B10] border border-slate-700/80 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-sky-500"
@@ -731,204 +1987,243 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
-              className="flex-1 flex items-center justify-center gap-1 py-1.5 rounded-lg bg-sky-500 text-slate-950 text-xs font-bold hover:bg-sky-400 cursor-pointer"
+              className="flex-1 flex items-center justify-center gap-1 py-1.5 rounded-lg bg-sky-500 text-slate-950 text-[11px] font-bold hover:bg-sky-400 cursor-pointer"
             >
               <Upload className="w-3.5 h-3.5" />
               ورود مدل (GLB/FBX/OBJ/STL/USD)
             </button>
             <button
               type="button"
-              onClick={handleGroupSelection}
-              disabled={!selectedNode}
-              className="p-1.5 rounded-lg border border-slate-700 bg-slate-800 text-slate-300 hover:text-slate-100 disabled:opacity-30 cursor-pointer"
-              title="گروه‌بندی مدل انتخاب شده"
+              onClick={handleGroupSelected}
+              className="p-1.5 rounded-lg border border-slate-700 bg-slate-800 text-amber-300 hover:text-amber-200 cursor-pointer"
+              title="ایجاد گروه / گروه‌بندی انتخاب‌شده‌ها (Ctrl+G)"
             >
               <FolderPlus className="w-3.5 h-3.5" />
             </button>
+            {selectedNode?.kind === 'group' && (
+              <button
+                type="button"
+                onClick={handleUngroupSelected}
+                className="p-1.5 rounded-lg border border-slate-700 bg-slate-800 text-sky-300 hover:text-sky-200 cursor-pointer"
+                title="لغو گروه (Ctrl+Shift+G)"
+              >
+                <Ungroup className="w-3.5 h-3.5" />
+              </button>
+            )}
           </div>
+
+          {/* Multi-select quick bar */}
+          <div className="flex items-center justify-between text-[10px] text-slate-400 px-1">
+            <span>
+              انتخاب‌شده: <strong className="text-sky-300">{selectedIds.length}</strong> (Ctrl/Shift + کلیک)
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setSelectedIds(nodes.filter((n) => n.kind !== 'group').map((n) => n.id))}
+                className="hover:text-sky-300 cursor-pointer"
+              >
+                انتخاب همه
+              </button>
+              {selectedIds.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setSelectedIds([])}
+                  className="hover:text-red-300 cursor-pointer"
+                >
+                  لغو
+                </button>
+              )}
+            </div>
+          </div>
+
+          {importStatus && (
+            <div className="p-2 rounded-lg border border-emerald-500/40 bg-emerald-500/10 text-[11px] text-emerald-300 flex items-start gap-1.5">
+              <CheckCircle2 className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+              <span>{importStatus}</span>
+            </div>
+          )}
+
+          {importError && (
+            <div className="p-2 rounded-lg border border-red-500/40 bg-red-500/10 text-[11px] text-red-300 flex items-start gap-1.5">
+              <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+              <span>{importError}</span>
+            </div>
+          )}
         </div>
 
-        {/* Hierarchy Tree List */}
-        <div className="flex-1 overflow-y-auto p-2 space-y-3">
-          {Object.entries(groupedNodes).map(([folderName, folderNodes]) => {
-            const isExpanded = expandedFolders[folderName] !== false;
-            return (
-              <div key={folderName} className="space-y-1">
-                {/* Folder Header */}
-                <div
-                  onClick={() => toggleFolder(folderName)}
-                  className="flex items-center justify-between px-2 py-1 rounded hover:bg-slate-800/60 cursor-pointer text-slate-400 text-xs font-semibold"
+        {/* Recursive Tree List with Root Dropzone */}
+        <div
+          className="flex-1 overflow-y-auto p-2 space-y-1"
+          onDragOver={(e) => {
+            if (draggedNodeId) e.preventDefault();
+          }}
+          onDrop={(e) => {
+            e.preventDefault();
+            if (draggedNodeId) {
+              reparentNode(draggedNodeId, null);
+              setDraggedNodeId(null);
+            }
+          }}
+        >
+          {rootNodes.map((n) => renderHierarchyNode(n, 0))}
+          {draggedNodeId && (
+            <div className="mt-2 py-2 border border-dashed border-sky-500/50 rounded-lg text-center text-[10px] text-sky-300">
+              رها کردن در ریشه صحنه (Root)
+            </div>
+          )}
+        </div>
+
+        {/* Tabbed Creation Palette (Primitives / Procedural / Project Assets) */}
+        <div className="border-t border-slate-800 bg-[#0C1018] flex flex-col">
+          <div className="grid grid-cols-3 border-b border-slate-800 text-[11px] font-semibold">
+            <button
+              type="button"
+              onClick={() => setPaletteTab('primitives')}
+              className={`py-2 text-center cursor-pointer transition-colors ${
+                paletteTab === 'primitives'
+                  ? 'bg-[#121826] text-sky-300 border-b-2 border-sky-400'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              اشکال اولیه
+            </button>
+            <button
+              type="button"
+              onClick={() => setPaletteTab('presets')}
+              className={`py-2 text-center cursor-pointer transition-colors ${
+                paletteTab === 'presets'
+                  ? 'bg-[#121826] text-amber-300 border-b-2 border-amber-400'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              مدل رویه‌ای
+            </button>
+            <button
+              type="button"
+              onClick={() => setPaletteTab('assets')}
+              className={`py-2 text-center cursor-pointer transition-colors ${
+                paletteTab === 'assets'
+                  ? 'bg-[#121826] text-emerald-300 border-b-2 border-emerald-400'
+                  : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              فایل‌ها ({project3DAssets.length})
+            </button>
+          </div>
+
+          <div className="p-2.5 max-h-44 overflow-y-auto">
+            {paletteTab === 'primitives' && (
+              <div className="grid grid-cols-2 gap-1.5">
+                {PRIMITIVE_CATALOG.map((item) => (
+                  <button
+                    key={item.type}
+                    type="button"
+                    onClick={() => addPrimitiveNode(item.type, item.label, item.color)}
+                    className="px-2 py-1.5 rounded bg-slate-800/80 hover:bg-slate-700 text-[11px] text-slate-200 text-right truncate cursor-pointer flex items-center gap-1.5"
+                  >
+                    <span
+                      className="w-2 h-2 rounded-sm shrink-0"
+                      style={{ backgroundColor: item.color }}
+                    />
+                    <span className="truncate">+ {item.label.split(' ')[0]}</span>
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  onClick={addLightNode}
+                  className="px-2 py-1.5 rounded bg-slate-800/80 hover:bg-slate-700 text-[11px] text-yellow-300 text-right truncate cursor-pointer flex items-center gap-1.5"
                 >
-                  <div className="flex items-center gap-1.5 truncate">
-                    {isExpanded ? (
-                      <ChevronDown className="w-3.5 h-3.5 shrink-0" />
-                    ) : (
-                      <ChevronRight className="w-3.5 h-3.5 shrink-0" />
-                    )}
-                    <Folder className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                    <span className="truncate">{folderName}</span>
+                  <Lightbulb className="w-3 h-3 shrink-0" />
+                  <span>+ نور نقطه‌ای</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSelectedIds([]);
+                    setTimeout(handleGroupSelected, 0);
+                  }}
+                  className="col-span-2 px-2 py-1.5 rounded bg-slate-800/70 hover:bg-slate-700 text-[11px] text-amber-300 text-center cursor-pointer"
+                >
+                  + ساخت گروه خالی (Group)
+                </button>
+              </div>
+            )}
+
+            {paletteTab === 'presets' && (
+              <div className="grid grid-cols-2 gap-1.5">
+                {PRESET_CATALOG.map((item) => (
+                  <button
+                    key={item.preset}
+                    type="button"
+                    onClick={() => addPresetModel(item.preset, item.label, item.color)}
+                    className={`px-2 py-1.5 rounded bg-slate-800/80 hover:bg-slate-700 text-[11px] ${item.textCls} text-right truncate cursor-pointer`}
+                  >
+                    + {item.label}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {paletteTab === 'assets' && (
+              <div className="space-y-1.5">
+                {project3DAssets.length === 0 ? (
+                  <div className="text-[11px] text-slate-500 text-center py-3">
+                    هنوز مدل سه‌بعدی وارد نشده است. فایل GLB/FBX/OBJ را آپلود یا روی صحنه رها کنید.
                   </div>
-                  <span className="text-[10px] text-slate-500 font-mono">({folderNodes.length})</span>
-                </div>
-
-                {/* Folder Children */}
-                {isExpanded && (
-                  <div className="pr-4 space-y-1 border-r border-slate-800 mr-2">
-                    {folderNodes.map((node) => {
-                      const isSel = node.id === selectedId;
-                      return (
-                        <div
-                          key={node.id}
-                          onClick={() => setSelectedId(node.id)}
-                          className={`group flex items-center justify-between gap-1.5 px-2 py-1.5 rounded-lg text-xs cursor-pointer transition-colors ${
-                            isSel
-                              ? 'bg-sky-500/20 border border-sky-500/40 text-sky-200'
-                              : 'border border-transparent text-slate-300 hover:bg-slate-800/70'
-                          }`}
-                        >
-                          <div className="flex items-center gap-1.5 min-w-0 flex-1">
-                            <Box
-                              className="w-3.5 h-3.5 shrink-0"
-                              style={{ color: node.color || '#38bdf8' }}
-                            />
-                            <span className="truncate font-medium">{node.name}</span>
-                            {node.format && (
-                              <span className="text-[9px] font-mono px-1 rounded bg-slate-800 text-slate-400 shrink-0">
-                                {node.format}
-                              </span>
-                            )}
-                          </div>
-
-                          <div className="flex items-center gap-1 shrink-0">
-                            {/* Visibility Toggle */}
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                updateNode(node.id, { visible: !node.visible });
-                              }}
-                              className="p-1 text-slate-400 hover:text-slate-100"
-                              title={node.visible ? 'پنهان کردن' : 'نمایش دادن'}
-                            >
-                              {node.visible ? (
-                                <Eye className="w-3 h-3 text-emerald-400" />
-                              ) : (
-                                <EyeOff className="w-3 h-3 text-slate-500" />
-                              )}
-                            </button>
-
-                            {/* Lock Toggle */}
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                updateNode(node.id, { locked: !node.locked });
-                              }}
-                              className="p-1 text-slate-400 hover:text-slate-100"
-                              title={node.locked ? 'باز کردن قفل' : 'قفل کردن'}
-                            >
-                              {node.locked ? (
-                                <Lock className="w-3 h-3 text-amber-400" />
-                              ) : (
-                                <Unlock className="w-3 h-3 text-slate-500 opacity-0 group-hover:opacity-100" />
-                              )}
-                            </button>
-
-                            {/* Duplicate */}
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                duplicateNode(node);
-                              }}
-                              className="p-1 text-slate-500 hover:text-sky-300 opacity-0 group-hover:opacity-100"
-                              title="کپی مدل"
-                            >
-                              <Copy className="w-3 h-3" />
-                            </button>
-
-                            {/* Delete */}
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                deleteNode(node.id);
-                              }}
-                              className="p-1 text-slate-500 hover:text-red-400 opacity-0 group-hover:opacity-100"
-                              title="حذف مدل"
-                            >
-                              <Trash2 className="w-3 h-3" />
-                            </button>
-                          </div>
+                ) : (
+                  project3DAssets.map((asset) => (
+                    <div
+                      key={asset.id}
+                      className="flex items-center justify-between gap-2 px-2 py-1.5 rounded bg-slate-800/60 border border-slate-700/60"
+                    >
+                      <div className="min-w-0">
+                        <div className="text-[11px] text-slate-200 font-medium truncate">
+                          {asset.name}
                         </div>
-                      );
-                    })}
-                  </div>
+                        <div className="text-[9px] text-slate-400 font-mono">
+                          {asset.format.toUpperCase()} • {asset.modelMeta?.vertexCount ?? 0} رأس
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => spawnExistingAssetToScene(asset)}
+                        className="px-2 py-1 rounded bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/30 text-[10px] font-semibold shrink-0 cursor-pointer flex items-center gap-1"
+                      >
+                        <Plus className="w-3 h-3" />
+                        افزودن
+                      </button>
+                    </div>
+                  ))
                 )}
               </div>
-            );
-          })}
-        </div>
-
-        {/* Quick Add 3D Presets Palette */}
-        <div className="p-3 border-t border-slate-800 bg-[#0C1018] space-y-2">
-          <div className="text-[11px] font-semibold text-slate-400 flex items-center justify-between">
-            <span>افزودن مدل‌های پیش‌فرض:</span>
-            <span className="text-[10px] text-slate-500">عدم حذف قبلی</span>
-          </div>
-          <div className="grid grid-cols-2 gap-1.5">
-            <button
-              type="button"
-              onClick={() => addPresetModel('hero-bot', 'ربات')}
-              className="px-2 py-1.5 rounded bg-slate-800/80 hover:bg-slate-700 text-[11px] text-sky-300 text-right truncate cursor-pointer"
-            >
-              + ربات قهرمان
-            </button>
-            <button
-              type="button"
-              onClick={() => addPresetModel('rover-car', 'ماشین')}
-              className="px-2 py-1.5 rounded bg-slate-800/80 hover:bg-slate-700 text-[11px] text-amber-300 text-right truncate cursor-pointer"
-            >
-              + ماشین کاوشگر
-            </button>
-            <button
-              type="button"
-              onClick={() => addPresetModel('turret', 'برجک')}
-              className="px-2 py-1.5 rounded bg-slate-800/80 hover:bg-slate-700 text-[11px] text-red-300 text-right truncate cursor-pointer"
-            >
-              + برجک تدافعی
-            </button>
-            <button
-              type="button"
-              onClick={() => addPresetModel('crystal-gem', 'کریستال')}
-              className="px-2 py-1.5 rounded bg-slate-800/80 hover:bg-slate-700 text-[11px] text-emerald-300 text-right truncate cursor-pointer"
-            >
-              + کریستال
-            </button>
-            <button
-              type="button"
-              onClick={() => addPresetModel('pine-tree', 'درخت')}
-              className="px-2 py-1.5 rounded bg-slate-800/80 hover:bg-slate-700 text-[11px] text-teal-300 text-right truncate cursor-pointer"
-            >
-              + درخت کاج
-            </button>
-            <button
-              type="button"
-              onClick={() => addPresetModel('crate', 'جعبه')}
-              className="px-2 py-1.5 rounded bg-slate-800/80 hover:bg-slate-700 text-[11px] text-orange-300 text-right truncate cursor-pointer"
-            >
-              + جعبه انبار
-            </button>
+            )}
           </div>
         </div>
       </aside>
 
-      {/* Center: 3D Viewport with Transform Gizmos */}
-      <main className="flex-1 flex flex-col min-w-0 h-full relative overflow-hidden">
+      {/* Center: 3D Viewport with Multi-Object Transform Gizmos & Drag/Drop Import */}
+      <main
+        className="flex-1 flex flex-col min-w-0 h-full relative overflow-hidden"
+        onDragOver={(e) => {
+          if (e.dataTransfer.types.includes('Files')) {
+            e.preventDefault();
+            setIsDraggingFile(true);
+          }
+        }}
+        onDragLeave={() => setIsDraggingFile(false)}
+        onDrop={(e) => {
+          if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+            e.preventDefault();
+            setIsDraggingFile(false);
+            void handleImport3DFiles(e.dataTransfer.files);
+          }
+        }}
+      >
         {/* Top Floating Viewport Control Toolbar */}
-        <div className="absolute top-3 left-3 right-3 z-10 pointer-events-none flex items-center justify-between">
-          {/* Gizmo Mode Switcher (Translate W, Rotate E, Scale R) */}
-          <div className="pointer-events-auto flex items-center gap-1 p-1 rounded-xl bg-[#0F1420]/90 backdrop-blur-md border border-slate-700/80 shadow-xl">
+        <div className="absolute top-3 left-3 right-3 z-10 pointer-events-none flex flex-wrap items-center justify-between gap-2">
+          {/* Gizmo Modes */}
+          <div className="pointer-events-auto flex items-center gap-1 p-1 rounded-xl bg-[#0F1420]/95 border border-slate-700/80 shadow-xl">
             <button
               type="button"
               onClick={() => setTransformMode('translate')}
@@ -966,7 +2261,7 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
               title="تغییر مقیاس (R)"
             >
               <Maximize2 className="w-3.5 h-3.5" />
-              بزرگ‌نمایی
+              مقیاس
             </button>
 
             <div className="w-px h-5 bg-slate-700 mx-1" />
@@ -979,24 +2274,87 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
             >
               {spaceMode === 'world' ? 'World' : 'Local'}
             </button>
+
+            {primarySelectedId && (
+              <button
+                type="button"
+                onClick={() => {
+                  const obj = modelObjectsRef.current.get(primarySelectedId);
+                  if (obj && orbitRef.current && sceneRef.current) {
+                    sceneRef.current.updateMatrixWorld(true);
+                    obj.getWorldPosition(_tmpVec);
+                    orbitRef.current.target.copy(_tmpVec);
+                  }
+                }}
+                className="p-1.5 rounded-lg text-slate-300 hover:text-sky-300 hover:bg-slate-800 cursor-pointer"
+                title="تمرکز دوربین روی شیء (F)"
+              >
+                <Focus className="w-3.5 h-3.5" />
+              </button>
+            )}
           </div>
 
-          {/* Quick Info Badge */}
-          <div className="pointer-events-auto px-3 py-1.5 rounded-xl bg-[#0F1420]/80 backdrop-blur-md border border-slate-800 text-xs text-slate-300 flex items-center gap-3">
-            <span>مدل انتخاب شده: <strong className="text-sky-300">{selectedNode ? selectedNode.name : 'هیچ'}</strong></span>
-            {selectedNode && (
-              <span className="text-[11px] text-slate-500">
-                [X: {selectedNode.position[0]}, Y: {selectedNode.position[1]}, Z: {selectedNode.position[2]}]
-              </span>
-            )}
+          {/* Save & Export Scene Actions */}
+          <div className="pointer-events-auto flex items-center gap-2">
+            <div className="px-3 py-1.5 rounded-xl bg-[#0F1420]/95 border border-slate-800 text-xs text-slate-300 hidden md:flex items-center gap-2">
+              {selectedIds.length > 1 ? (
+                <span>
+                  انتخاب چندگانه: <strong className="text-amber-300">{selectedIds.length} شیء</strong>
+                </span>
+              ) : (
+                <span>
+                  انتخاب:{' '}
+                  <strong className="text-sky-300">{selectedNode ? selectedNode.name : 'هیچ'}</strong>
+                </span>
+              )}
+            </div>
+
+            <button
+              type="button"
+              onClick={handleExplicitSaveScene}
+              className="px-3 py-1.5 rounded-xl bg-emerald-500 text-slate-950 font-bold text-xs hover:bg-emerald-400 flex items-center gap-1.5 shadow-lg cursor-pointer"
+            >
+              <Save className="w-3.5 h-3.5" />
+              ذخیره صحنه
+            </button>
+
+            <button
+              type="button"
+              onClick={handleExportSceneGLB}
+              className="px-3 py-1.5 rounded-xl bg-[#0F1420]/95 border border-slate-700 text-slate-200 hover:border-sky-400 hover:text-sky-300 text-xs font-semibold flex items-center gap-1.5 shadow-lg cursor-pointer"
+              title="خروجی کل صحنه به فایل استاندارد GLB"
+            >
+              <Download className="w-3.5 h-3.5" />
+              خروجی GLB
+            </button>
           </div>
         </div>
 
+        {/* Save / Export Toast */}
+        {saveFeedback && (
+          <div className="absolute top-16 left-1/2 -translate-x-1/2 z-20 px-4 py-2 rounded-xl bg-emerald-500/95 text-slate-950 text-xs font-bold shadow-xl flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4" />
+            <span>{saveFeedback}</span>
+          </div>
+        )}
+
+        {/* Drag-and-Drop File Overlay */}
+        {isDraggingFile && (
+          <div className="absolute inset-0 z-30 bg-sky-500/15 border-2 border-dashed border-sky-400 flex items-center justify-center pointer-events-none">
+            <div className="px-6 py-4 rounded-2xl bg-[#0F1420] border border-sky-400 text-sky-200 text-sm font-bold shadow-2xl">
+              فایل سه‌بعدی را برای ورود به صحنه رها کنید (GLB, glTF, FBX, OBJ, STL, USDZ)
+            </div>
+          </div>
+        )}
+
         {/* WebGL Canvas Container */}
-        <div ref={mountRef} className="flex-1 w-full h-full relative cursor-grab active:cursor-grabbing" />
+        <div
+          ref={mountRef}
+          className="flex-1 w-full h-full relative cursor-grab active:cursor-grabbing"
+        />
 
         {/* Bottom Animation & Playback Bar */}
-        <div className="absolute bottom-3 left-1/2 -translate-x-1/2 z-10 px-4 py-2 rounded-2xl bg-[#0F1420]/95 backdrop-blur-md border border-slate-700/80 shadow-2xl flex items-center gap-4 text-xs">
+        <div className="absolute bottom-3 left-1/2 -translate-x-1/2 z-10 px-4 py-2 rounded-2xl bg-[#0F1420]/95 border border-slate-700/80 shadow-2xl flex items-center gap-4 text-xs">
           <div className="flex items-center gap-2">
             <button
               type="button"
@@ -1027,135 +2385,417 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
         </div>
       </main>
 
-      {/* Right / Secondary Sidebar: Selected Model Transform Inspector */}
-      {selectedNode && (
+      {/* Right Sidebar: Single or Multi-Selection Inspector */}
+      {selectedIds.length > 1 ? (
         <aside className="w-full lg:w-72 shrink-0 border-t lg:border-t-0 lg:border-r border-slate-800 bg-[#0E121B] p-4 flex flex-col space-y-4 overflow-y-auto">
           <div className="flex items-center justify-between pb-3 border-b border-slate-800">
             <div>
-              <h3 className="text-xs font-bold text-slate-100">{selectedNode.name}</h3>
-              <p className="text-[10px] text-slate-500 font-mono">{selectedNode.id}</p>
+              <h3 className="text-xs font-bold text-amber-300">
+                انتخاب چندگانه ({selectedIds.length} شیء)
+              </h3>
+              <p className="text-[10px] text-slate-400 mt-0.5">
+                با گیزمو می‌توانید همه را هم‌زمان جابه‌جا یا مقیاس کنید
+              </p>
             </div>
             <button
               type="button"
-              onClick={() => setSelectedId(null)}
-              className="text-xs text-slate-500 hover:text-slate-300"
+              onClick={() => setSelectedIds([])}
+              className="text-xs text-slate-500 hover:text-slate-300 cursor-pointer"
             >
               بستن
             </button>
           </div>
 
-          {/* Transform Coordinates Inputs */}
-          <div className="space-y-3 text-xs">
-            {/* Position */}
-            <div className="space-y-1.5">
-              <span className="font-semibold text-slate-300 flex items-center justify-between">
-                <span>موقعیت (Position)</span>
-                <span className="text-[10px] text-slate-500 font-mono">X, Y, Z</span>
-              </span>
-              <div className="grid grid-cols-3 gap-1.5">
-                {(['x', 'y', 'z'] as const).map((axis, i) => (
-                  <div key={axis} className="flex items-center bg-[#080B10] border border-slate-800 rounded px-1.5 py-1">
-                    <span className="text-[10px] uppercase font-mono font-bold text-slate-500 ml-1">{axis}</span>
-                    <input
-                      type="number"
-                      step="0.1"
-                      value={selectedNode.position[i]}
-                      onChange={(e) => {
-                        const val = parseFloat(e.target.value) || 0;
-                        const next: [number, number, number] = [...selectedNode.position];
-                        next[i] = val;
-                        updateNode(selectedNode.id, { position: next });
-                      }}
-                      className="w-full bg-transparent text-slate-200 text-xs font-mono focus:outline-none text-left"
-                    />
-                  </div>
-                ))}
-              </div>
-            </div>
+          <div className="space-y-2">
+            <button
+              type="button"
+              onClick={handleGroupSelected}
+              className="w-full py-2 rounded-lg bg-amber-500 text-slate-950 font-bold text-xs hover:bg-amber-400 flex items-center justify-center gap-1.5 cursor-pointer"
+            >
+              <FolderPlus className="w-3.5 h-3.5" />
+              گروه‌بندی انتخاب‌شده‌ها (Ctrl+G)
+            </button>
 
-            {/* Rotation */}
-            <div className="space-y-1.5">
-              <span className="font-semibold text-slate-300 flex items-center justify-between">
-                <span>چرخش زاویه (Rotation)</span>
-                <span className="text-[10px] text-slate-500 font-mono">درجه</span>
-              </span>
-              <div className="grid grid-cols-3 gap-1.5">
-                {(['x', 'y', 'z'] as const).map((axis, i) => (
-                  <div key={axis} className="flex items-center bg-[#080B10] border border-slate-800 rounded px-1.5 py-1">
-                    <span className="text-[10px] uppercase font-mono font-bold text-slate-500 ml-1">{axis}</span>
-                    <input
-                      type="number"
-                      step="5"
-                      value={selectedNode.rotation[i]}
-                      onChange={(e) => {
-                        const val = parseFloat(e.target.value) || 0;
-                        const next: [number, number, number] = [...selectedNode.rotation];
-                        next[i] = val;
-                        updateNode(selectedNode.id, { rotation: next });
-                      }}
-                      className="w-full bg-transparent text-slate-200 text-xs font-mono focus:outline-none text-left"
-                    />
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            {/* Scale */}
-            <div className="space-y-1.5">
-              <span className="font-semibold text-slate-300 flex items-center justify-between">
-                <span>مقیاس ابعاد (Scale)</span>
-                <span className="text-[10px] text-slate-500 font-mono">ضریب</span>
-              </span>
-              <div className="grid grid-cols-3 gap-1.5">
-                {(['x', 'y', 'z'] as const).map((axis, i) => (
-                  <div key={axis} className="flex items-center bg-[#080B10] border border-slate-800 rounded px-1.5 py-1">
-                    <span className="text-[10px] uppercase font-mono font-bold text-slate-500 ml-1">{axis}</span>
-                    <input
-                      type="number"
-                      step="0.1"
-                      value={selectedNode.scale[i]}
-                      onChange={(e) => {
-                        const val = parseFloat(e.target.value) || 1;
-                        const next: [number, number, number] = [...selectedNode.scale];
-                        next[i] = val;
-                        updateNode(selectedNode.id, { scale: next });
-                      }}
-                      className="w-full bg-transparent text-slate-200 text-xs font-mono focus:outline-none text-left"
-                    />
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            {/* Layer Assignment */}
-            <div className="space-y-1.5 pt-2 border-t border-slate-800">
-              <label className="font-semibold text-slate-300">لایه دسته‌بندی</label>
-              <select
-                value={selectedNode.layerId}
-                onChange={(e) => updateNode(selectedNode.id, { layerId: e.target.value })}
-                className="w-full px-2.5 py-1.5 rounded-lg bg-[#080B10] border border-slate-700 text-xs text-slate-200 focus:outline-none"
+            <div className="grid grid-cols-3 gap-1.5">
+              <button
+                type="button"
+                onClick={() => handleAlignSelected('ground')}
+                className="py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-200 cursor-pointer"
               >
-                {DEFAULT_LAYERS.map((layer) => (
-                  <option key={layer.id} value={layer.id}>
-                    {layer.name}
-                  </option>
-                ))}
-              </select>
+                تراز زمین (Y=0)
+              </button>
+              <button
+                type="button"
+                onClick={() => handleAlignSelected('centerX')}
+                className="py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-200 cursor-pointer"
+              >
+                هم‌تراز X=0
+              </button>
+              <button
+                type="button"
+                onClick={() => handleAlignSelected('centerZ')}
+                className="py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-[11px] text-slate-200 cursor-pointer"
+              >
+                هم‌تراز Z=0
+              </button>
             </div>
 
-            {/* Folder Name */}
-            <div className="space-y-1.5">
-              <label className="font-semibold text-slate-300">پوشه سلسله‌مراتب</label>
-              <input
-                type="text"
-                value={selectedNode.folder || ''}
-                onChange={(e) => updateNode(selectedNode.id, { folder: e.target.value })}
-                placeholder="نام پوشه..."
-                className="w-full px-2.5 py-1.5 rounded-lg bg-[#080B10] border border-slate-700 text-xs text-slate-200 focus:outline-none"
-              />
+            <div className="grid grid-cols-2 gap-1.5 pt-1">
+              <button
+                type="button"
+                onClick={() => duplicateNodes(selectedIds)}
+                className="py-1.5 rounded-lg border border-sky-500/40 bg-sky-500/10 text-sky-300 text-xs font-semibold hover:bg-sky-500/20 flex items-center justify-center gap-1 cursor-pointer"
+              >
+                <Copy className="w-3.5 h-3.5" />
+                کپی همه
+              </button>
+              <button
+                type="button"
+                onClick={() => deleteNodes(selectedIds)}
+                className="py-1.5 rounded-lg border border-red-500/40 bg-red-500/10 text-red-300 text-xs font-semibold hover:bg-red-500/20 flex items-center justify-center gap-1 cursor-pointer"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                حذف همه
+              </button>
+            </div>
+          </div>
+
+          <div className="space-y-1.5 pt-2 border-t border-slate-800">
+            <span className="text-[11px] font-semibold text-slate-400">اقلام انتخاب‌شده:</span>
+            <div className="space-y-1 max-h-60 overflow-y-auto">
+              {selectedIds.map((id) => {
+                const n = nodeMap.get(id);
+                if (!n) return null;
+                return (
+                  <div
+                    key={id}
+                    className="flex items-center justify-between px-2 py-1 rounded bg-[#080B10] border border-slate-800 text-[11px]"
+                  >
+                    <span className="truncate text-slate-200">{n.name}</span>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedIds((prev) => prev.filter((x) => x !== id))}
+                      className="text-slate-500 hover:text-red-400 text-[10px] cursor-pointer"
+                    >
+                      خروج
+                    </button>
+                  </div>
+                );
+              })}
             </div>
           </div>
         </aside>
+      ) : (
+        selectedNode && (
+          <aside className="w-full lg:w-72 shrink-0 border-t lg:border-t-0 lg:border-r border-slate-800 bg-[#0E121B] p-4 flex flex-col space-y-4 overflow-y-auto">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800 gap-2">
+              <div className="min-w-0 flex-1">
+                <input
+                  type="text"
+                  value={selectedNode.name}
+                  onChange={(e) => updateNode(selectedNode.id, { name: e.target.value }, true)}
+                  className="w-full bg-transparent text-xs font-bold text-slate-100 border-b border-transparent focus:border-sky-500 focus:outline-none"
+                />
+                <p className="text-[10px] text-slate-500 font-mono truncate">{selectedNode.id}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSelectedIds([])}
+                className="text-xs text-slate-500 hover:text-slate-300 cursor-pointer shrink-0"
+              >
+                بستن
+              </button>
+            </div>
+
+            {/* Transform Coordinates Inputs */}
+            <div className="space-y-3 text-xs">
+              {/* Position */}
+              <div className="space-y-1.5">
+                <span className="font-semibold text-slate-300 flex items-center justify-between">
+                  <span>موقعیت (Position)</span>
+                  <span className="text-[10px] text-slate-500 font-mono">X, Y, Z</span>
+                </span>
+                <div className="grid grid-cols-3 gap-1.5">
+                  {(['x', 'y', 'z'] as const).map((axis, i) => (
+                    <div
+                      key={axis}
+                      className="flex items-center bg-[#080B10] border border-slate-800 rounded px-1.5 py-1"
+                    >
+                      <span className="text-[10px] uppercase font-mono font-bold text-slate-500 ml-1">
+                        {axis}
+                      </span>
+                      <input
+                        type="number"
+                        step="0.1"
+                        value={selectedNode.position[i]}
+                        onChange={(e) => {
+                          const val = parseFloat(e.target.value) || 0;
+                          const next: [number, number, number] = [...selectedNode.position];
+                          next[i] = val;
+                          updateNode(selectedNode.id, { position: next }, true);
+                        }}
+                        className="w-full bg-transparent text-slate-200 text-xs font-mono focus:outline-none text-left"
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Rotation */}
+              <div className="space-y-1.5">
+                <span className="font-semibold text-slate-300 flex items-center justify-between">
+                  <span>چرخش زاویه (Rotation)</span>
+                  <span className="text-[10px] text-slate-500 font-mono">درجه</span>
+                </span>
+                <div className="grid grid-cols-3 gap-1.5">
+                  {(['x', 'y', 'z'] as const).map((axis, i) => (
+                    <div
+                      key={axis}
+                      className="flex items-center bg-[#080B10] border border-slate-800 rounded px-1.5 py-1"
+                    >
+                      <span className="text-[10px] uppercase font-mono font-bold text-slate-500 ml-1">
+                        {axis}
+                      </span>
+                      <input
+                        type="number"
+                        step="5"
+                        value={selectedNode.rotation[i]}
+                        onChange={(e) => {
+                          const val = parseFloat(e.target.value) || 0;
+                          const next: [number, number, number] = [...selectedNode.rotation];
+                          next[i] = val;
+                          updateNode(selectedNode.id, { rotation: next }, true);
+                        }}
+                        className="w-full bg-transparent text-slate-200 text-xs font-mono focus:outline-none text-left"
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Scale */}
+              <div className="space-y-1.5">
+                <span className="font-semibold text-slate-300 flex items-center justify-between">
+                  <span>مقیاس ابعاد (Scale)</span>
+                  <span className="text-[10px] text-slate-500 font-mono">ضریب</span>
+                </span>
+                <div className="grid grid-cols-3 gap-1.5">
+                  {(['x', 'y', 'z'] as const).map((axis, i) => (
+                    <div
+                      key={axis}
+                      className="flex items-center bg-[#080B10] border border-slate-800 rounded px-1.5 py-1"
+                    >
+                      <span className="text-[10px] uppercase font-mono font-bold text-slate-500 ml-1">
+                        {axis}
+                      </span>
+                      <input
+                        type="number"
+                        step="0.1"
+                        value={selectedNode.scale[i]}
+                        onChange={(e) => {
+                          const val = parseFloat(e.target.value) || 1;
+                          const next: [number, number, number] = [...selectedNode.scale];
+                          next[i] = val;
+                          updateNode(selectedNode.id, { scale: next }, true);
+                        }}
+                        className="w-full bg-transparent text-slate-200 text-xs font-mono focus:outline-none text-left"
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Material / Color / PBR Controls */}
+              {selectedNode.kind !== 'group' && (
+                <div className="space-y-2.5 pt-2 border-t border-slate-800">
+                  <div className="flex items-center justify-between">
+                    <span className="font-semibold text-slate-300">رنگ متریال / نور</span>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="color"
+                        value={selectedNode.color || '#38bdf8'}
+                        onChange={(e) => updateNode(selectedNode.id, { color: e.target.value }, true)}
+                        className="w-7 h-7 rounded border border-slate-700 bg-transparent cursor-pointer"
+                      />
+                      <span className="text-[10px] font-mono text-slate-400">
+                        {selectedNode.color}
+                      </span>
+                    </div>
+                  </div>
+
+                  {selectedNode.kind === 'light' ? (
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-[11px] text-slate-400">
+                        <span>شدت نور</span>
+                        <span className="font-mono">{selectedNode.lightIntensity ?? 4}</span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0.2}
+                        max={20}
+                        step={0.2}
+                        value={selectedNode.lightIntensity ?? 4}
+                        onChange={(e) =>
+                          updateNode(
+                            selectedNode.id,
+                            { lightIntensity: parseFloat(e.target.value) },
+                            true
+                          )
+                        }
+                        className="w-full accent-amber-400"
+                      />
+                    </div>
+                  ) : (
+                    selectedNode.kind !== 'model-asset' && (
+                      <>
+                        <div className="space-y-1">
+                          <div className="flex justify-between text-[11px] text-slate-400">
+                            <span>زبری سطح (Roughness)</span>
+                            <span className="font-mono">
+                              {(selectedNode.roughness ?? 0.42).toFixed(2)}
+                            </span>
+                          </div>
+                          <input
+                            type="range"
+                            min={0.05}
+                            max={1}
+                            step={0.05}
+                            value={selectedNode.roughness ?? 0.42}
+                            onChange={(e) =>
+                              updateNode(
+                                selectedNode.id,
+                                { roughness: parseFloat(e.target.value) },
+                                true
+                              )
+                            }
+                            className="w-full accent-sky-400"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <div className="flex justify-between text-[11px] text-slate-400">
+                            <span>فلزیت (Metalness)</span>
+                            <span className="font-mono">
+                              {(selectedNode.metalness ?? 0.25).toFixed(2)}
+                            </span>
+                          </div>
+                          <input
+                            type="range"
+                            min={0}
+                            max={1}
+                            step={0.05}
+                            value={selectedNode.metalness ?? 0.25}
+                            onChange={(e) =>
+                              updateNode(
+                                selectedNode.id,
+                                { metalness: parseFloat(e.target.value) },
+                                true
+                              )
+                            }
+                            className="w-full accent-sky-400"
+                          />
+                        </div>
+                      </>
+                    )
+                  )}
+                </div>
+              )}
+
+              {/* Parent Assignment in Real Hierarchy */}
+              <div className="space-y-1.5 pt-2 border-t border-slate-800">
+                <label className="font-semibold text-slate-300 flex items-center gap-1.5">
+                  <FolderTree className="w-3.5 h-3.5 text-amber-400" />
+                  والد در سلسله‌مراتب (Parent)
+                </label>
+                <select
+                  value={selectedNode.parentId || ''}
+                  onChange={(e) => reparentNode(selectedNode.id, e.target.value || null)}
+                  className="w-full px-2.5 py-1.5 rounded-lg bg-[#080B10] border border-slate-700 text-xs text-slate-200 focus:outline-none"
+                >
+                  <option value="">ریشه صحنه (Root)</option>
+                  {nodes
+                    .filter(
+                      (n) =>
+                        n.id !== selectedNode.id &&
+                        !isDescendantOf(n.id, selectedNode.id, nodeMap)
+                    )
+                    .map((n) => (
+                      <option key={n.id} value={n.id}>
+                        {n.kind === 'group' ? '📁 ' : ''}
+                        {n.name}
+                      </option>
+                    ))}
+                </select>
+              </div>
+
+              {/* Layer Assignment */}
+              <div className="space-y-1.5">
+                <label className="font-semibold text-slate-300 flex items-center gap-1.5">
+                  <Layers className="w-3.5 h-3.5 text-sky-400" />
+                  لایه دسته‌بندی
+                </label>
+                <select
+                  value={selectedNode.layerId}
+                  onChange={(e) => updateNode(selectedNode.id, { layerId: e.target.value }, true)}
+                  className="w-full px-2.5 py-1.5 rounded-lg bg-[#080B10] border border-slate-700 text-xs text-slate-200 focus:outline-none"
+                >
+                  {DEFAULT_LAYERS.map((layer) => (
+                    <option key={layer.id} value={layer.id}>
+                      {layer.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Group / Ungroup Actions */}
+              {selectedNode.kind === 'group' && (
+                <button
+                  type="button"
+                  onClick={handleUngroupSelected}
+                  className="w-full py-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 text-amber-300 text-xs font-semibold hover:bg-amber-500/20 flex items-center justify-center gap-1.5 cursor-pointer"
+                >
+                  <Ungroup className="w-3.5 h-3.5" />
+                  لغو گروه و آزادسازی فرزندان
+                </button>
+              )}
+
+              {/* Animation clips metadata if imported model */}
+              {selectedNode.animations && selectedNode.animations.length > 0 && (
+                <div className="p-2.5 rounded-lg bg-[#080B10] border border-slate-800 space-y-1">
+                  <span className="text-[11px] font-semibold text-emerald-400">
+                    انیمیشن‌های مدل ({selectedNode.animations.length}):
+                  </span>
+                  <div className="text-[10px] text-slate-400 space-y-0.5">
+                    {selectedNode.animations.map((anim, i) => (
+                      <div key={i} className="truncate font-mono">
+                        • {anim}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Duplicate & Delete */}
+              <div className="grid grid-cols-2 gap-2 pt-2 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => duplicateNodes([selectedNode.id])}
+                  className="py-1.5 rounded-lg border border-sky-500/40 bg-sky-500/10 text-sky-300 text-xs font-semibold hover:bg-sky-500/20 flex items-center justify-center gap-1 cursor-pointer"
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                  کپی
+                </button>
+                <button
+                  type="button"
+                  onClick={() => deleteNodes([selectedNode.id])}
+                  className="py-1.5 rounded-lg border border-red-500/40 bg-red-500/10 text-red-300 text-xs font-semibold hover:bg-red-500/20 flex items-center justify-center gap-1 cursor-pointer"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  حذف
+                </button>
+              </div>
+            </div>
+          </aside>
+        )
       )}
     </div>
   );

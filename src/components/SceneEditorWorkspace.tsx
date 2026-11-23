@@ -45,6 +45,7 @@ import type {
   GameScene,
   Model3DPresetType,
   RayanAsset,
+  AssetFormat,
   RayanProject,
   ScreenPreset,
   Shape2DType,
@@ -54,13 +55,19 @@ import { Engine2D, type RuntimeStatsPayload } from '../engine/Engine2D';
 import { Engine3D } from '../engine/Engine3D';
 import { audioEngine } from '../engine/audioEngine';
 import { parsePersianRules } from '../engine/ruleParser';
+import { parseAndInspect3DModelFile } from '../engine/threeModels';
+import { arrayBufferToDataUrl, saveAssetToDb } from '../storage/projectDb';
 import { ColorPickerField } from './ColorPickerField';
 
 interface SceneEditorWorkspaceProps {
   project: RayanProject;
   isPlaying: boolean;
   onTogglePlay: (playing: boolean) => void;
-  onUpdateProject: (updater: (prev: RayanProject) => RayanProject) => void;
+  onUpdateProject: (
+    updater: (prev: RayanProject) => RayanProject,
+    skipHistory?: boolean,
+    persistNow?: boolean
+  ) => void;
   onSaveProject: () => void;
   savingState: 'idle' | 'saving' | 'saved';
   canUndo: boolean;
@@ -914,68 +921,140 @@ export const SceneEditorWorkspace: React.FC<SceneEditorWorkspaceProps> = ({
     setSelectedEntityId(id);
   };
 
+  const [quickUploadError, setQuickUploadError] = useState<string | null>(null);
+
   const handleQuickUpload = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
+    setQuickUploadError(null);
     const file = files[0];
     const ext = file.name.split('.').pop()?.toLowerCase() || '';
     const isImg = ['png', 'jpg', 'jpeg', 'webp', 'svg'].includes(ext);
-    const is3DModel = ['glb', 'gltf', 'obj', 'stl', 'fbx', 'ply'].includes(ext);
-    if (!isImg && !is3DModel) return;
+    const is3DModel = ['glb', 'gltf', 'obj', 'stl', 'fbx', 'ply', 'usd', 'usdz'].includes(ext);
+    if (!isImg && !is3DModel) {
+      setQuickUploadError(`فرمت «${file.name}» پشتیبانی نمی‌شود.`);
+      return;
+    }
 
-    const dataUrl = await new Promise<string>((resolve) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(String(reader.result || ''));
-      reader.readAsDataURL(file);
-    });
+    try {
+      const buffer = await file.arrayBuffer();
+      if (!buffer || buffer.byteLength === 0) {
+        throw new Error('فایل خالی است.');
+      }
 
-    const asset: RayanAsset = {
-      id: `asset_${Date.now()}`,
-      name: file.name.replace(/\.[^.]+$/, ''),
-      kind: isImg ? 'image' : 'model3d',
-      format: (ext === 'jpeg' ? 'jpg' : ext) as RayanAsset['format'],
-      dataUrl,
-      sizeBytes: file.size,
-      createdAt: Date.now(),
-    };
+      const format = (ext === 'jpeg' ? 'jpg' : ext) as AssetFormat;
+      const mimeType = isImg
+        ? format === 'svg'
+          ? 'image/svg+xml'
+          : `image/${format === 'jpg' ? 'jpeg' : format}`
+        : format === 'glb'
+          ? 'model/gltf-binary'
+          : format === 'gltf'
+            ? 'model/gltf+json'
+            : 'application/octet-stream';
+      const dataUrl = arrayBufferToDataUrl(buffer, mimeType);
 
-    const entId = `ent_${Date.now()}_u`;
-    const newEnt: GameEntity = {
-      id: entId,
-      name: asset.name,
-      role: 'prop',
-      kind: isImg ? 'sprite2d' : 'model3d-asset',
-      assetId: asset.id,
-      x: project.engineMode === '3d' ? 0 : 240,
-      y: project.engineMode === '3d' ? 0 : 240,
-      z: 0,
-      width: project.engineMode === '3d' ? 1.5 : 84,
-      height: project.engineMode === '3d' ? 1.5 : 84,
-      depth: 1.5,
-      rotationX: 0,
-      rotationY: 0,
-      rotationZ: 0,
-      color: '#F8FAFC',
-      opacity: 1,
-      visible: true,
-      physics: {
-        enabled: true,
-        isStatic: false,
-        useGravity: false,
-        mass: 1,
-        bounce: 0.1,
-        friction: 0.85,
-        collider: 'box',
-      },
-    };
+      let modelMeta = undefined;
+      if (is3DModel) {
+        const parsed = await parseAndInspect3DModelFile(buffer, format, '#38bdf8');
+        modelMeta = parsed.meta;
+      }
 
-    onUpdateProject((prev) => ({
-      ...prev,
-      engineMode: is3DModel ? '3d' : prev.engineMode,
-      assets: [...prev.assets, asset],
-      entities: [...prev.entities, newEnt],
-      updatedAt: Date.now(),
-    }));
-    setSelectedEntityId(entId);
+      const assetId = `asset_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
+      const assetName = file.name.replace(/\.[^.]+$/, '');
+
+      await saveAssetToDb({
+        id: assetId,
+        name: assetName,
+        kind: isImg ? 'image' : 'model3d',
+        format,
+        sizeBytes: file.size,
+        createdAt: Date.now(),
+        buffer,
+        dataUrl,
+        modelMeta,
+      });
+
+      const asset: RayanAsset = {
+        id: assetId,
+        name: assetName,
+        kind: isImg ? 'image' : 'model3d',
+        format,
+        dataUrl,
+        sizeBytes: file.size,
+        createdAt: Date.now(),
+        modelMeta,
+        storedInIdb: true,
+      };
+
+      const entId = `ent_${Date.now()}_u`;
+      const newEnt: GameEntity = {
+        id: entId,
+        name: asset.name,
+        role: 'prop',
+        kind: isImg ? 'sprite2d' : 'model3d-asset',
+        assetId: asset.id,
+        x: is3DModel ? 0 : 240,
+        y: is3DModel ? 0 : 240,
+        z: 0,
+        width: is3DModel ? 1.5 : 84,
+        height: is3DModel ? 1.5 : 84,
+        depth: 1.5,
+        rotationX: 0,
+        rotationY: 0,
+        rotationZ: 0,
+        color: '#F8FAFC',
+        opacity: 1,
+        visible: true,
+        physics: {
+          enabled: true,
+          isStatic: false,
+          useGravity: false,
+          mass: 1,
+          bounce: 0.1,
+          friction: 0.85,
+          collider: 'box',
+        },
+      };
+
+      onUpdateProject(
+        (prev) => ({
+          ...prev,
+          engineMode: is3DModel ? '3d' : prev.engineMode,
+          assets: [asset, ...prev.assets],
+          entities: [...prev.entities, newEnt],
+          studio3dNodes: is3DModel
+            ? [
+                ...(prev.studio3dNodes || []),
+                {
+                  id: `node_${entId}`,
+                  name: asset.name,
+                  kind: 'model-asset',
+                  assetId: asset.id,
+                  format: format.toUpperCase(),
+                  position: [0, 0, 0],
+                  rotation: [0, 0, 0],
+                  scale: [1, 1, 1],
+                  color: '#38bdf8',
+                  visible: true,
+                  locked: false,
+                  parentId: null,
+                  layerId: 'characters',
+                  folder: 'مدل‌های وارد شده',
+                  animations: modelMeta?.animationNames,
+                },
+              ]
+            : prev.studio3dNodes,
+          updatedAt: Date.now(),
+        }),
+        false,
+        true
+      );
+      setSelectedEntityId(entId);
+    } catch (err) {
+      setQuickUploadError(
+        `خطا در بارگذاری «${file.name}»: ${err instanceof Error ? err.message : 'فایل نامعتبر'}`
+      );
+    }
   };
 
   const applyScreenPreset = (presetId: ScreenPreset) => {
@@ -1396,7 +1475,7 @@ export const SceneEditorWorkspace: React.FC<SceneEditorWorkspaceProps> = ({
                 <input
                   ref={quickFileRef}
                   type="file"
-                  accept=".png,.jpg,.jpeg,.webp,.svg,.glb,.gltf,.obj,.stl,.fbx,.ply"
+                  accept=".png,.jpg,.jpeg,.webp,.svg,.glb,.gltf,.obj,.stl,.fbx,.ply,.usd,.usdz"
                   className="hidden"
                   onChange={(e) => {
                     void handleQuickUpload(e.target.files);
@@ -1412,6 +1491,11 @@ export const SceneEditorWorkspace: React.FC<SceneEditorWorkspaceProps> = ({
                   فایل / مدل
                 </button>
               </div>
+              {quickUploadError && (
+                <div className="rounded border border-red-500/40 bg-red-500/10 px-2 py-1 text-[11px] text-red-300">
+                  {quickUploadError}
+                </div>
+              )}
 
               <div className="grid grid-cols-2 gap-1.5">
                 {project.engineMode === '2d' ? (

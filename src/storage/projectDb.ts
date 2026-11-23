@@ -1,4 +1,12 @@
-import type { CodeFileItem, GameScene, RayanProject, TileType } from '../types/studio';
+import type {
+  AssetFormat,
+  AssetKind,
+  CodeFileItem,
+  GameScene,
+  Model3DMetadata,
+  RayanProject,
+  TileType,
+} from '../types/studio';
 import { parsePersianRules } from '../engine/ruleParser';
 
 export function createDefaultCodeFiles(projectName = 'بازی رایان'): CodeFileItem[] {
@@ -61,8 +69,21 @@ function onUpdate(api, dt) {
 }
 
 const DB_NAME = 'rayan_game_studio_db';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE_PROJECTS = 'projects';
+const STORE_ASSETS = 'assets';
+
+export interface StoredAssetRecord {
+  id: string;
+  name: string;
+  kind: AssetKind;
+  format: AssetFormat;
+  sizeBytes: number;
+  createdAt: number;
+  buffer: ArrayBuffer;
+  dataUrl?: string;
+  modelMeta?: Model3DMetadata;
+}
 
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -72,8 +93,70 @@ function openDb(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(STORE_PROJECTS)) {
         db.createObjectStore(STORE_PROJECTS, { keyPath: 'id' });
       }
+      if (!db.objectStoreNames.contains(STORE_ASSETS)) {
+        db.createObjectStore(STORE_ASSETS, { keyPath: 'id' });
+      }
     };
     req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+export function arrayBufferToDataUrl(buffer: ArrayBuffer, mimeType = 'application/octet-stream'): string {
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return `data:${mimeType};base64,${btoa(binary)}`;
+}
+
+export async function saveAssetToDb(record: StoredAssetRecord): Promise<StoredAssetRecord> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_ASSETS, 'readwrite');
+    const store = tx.objectStore(STORE_ASSETS);
+    const req = store.put(record);
+    req.onsuccess = () => resolve(record);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+export async function getAssetFromDb(id: string): Promise<StoredAssetRecord | null> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_ASSETS, 'readonly');
+    const store = tx.objectStore(STORE_ASSETS);
+    const req = store.get(id);
+    req.onsuccess = () => resolve((req.result as StoredAssetRecord | undefined) || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+export async function listAssetsFromDb(): Promise<StoredAssetRecord[]> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_ASSETS, 'readonly');
+    const store = tx.objectStore(STORE_ASSETS);
+    const req = store.getAll();
+    req.onsuccess = () => {
+      const items = ((req.result as StoredAssetRecord[]) || []).sort(
+        (a, b) => b.createdAt - a.createdAt
+      );
+      resolve(items);
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+export async function deleteAssetFromDb(id: string): Promise<void> {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_ASSETS, 'readwrite');
+    const store = tx.objectStore(STORE_ASSETS);
+    const req = store.delete(id);
+    req.onsuccess = () => resolve();
     req.onerror = () => reject(req.error);
   });
 }
@@ -117,6 +200,7 @@ export function normalizeProject(raw: RayanProject): RayanProject {
   return {
     ...raw,
     assets: raw.assets || [],
+    studio3dNodes: Array.isArray(raw.studio3dNodes) ? raw.studio3dNodes : undefined,
     codeFiles: Array.isArray(raw.codeFiles) ? raw.codeFiles : createDefaultCodeFiles(raw.name),
     scenes,
     activeSceneId,
@@ -137,7 +221,7 @@ export function normalizeProject(raw: RayanProject): RayanProject {
 
 export async function listSavedProjects(): Promise<RayanProject[]> {
   const db = await openDb();
-  return new Promise((resolve, reject) => {
+  const projects = await new Promise<RayanProject[]>((resolve, reject) => {
     const tx = db.transaction(STORE_PROJECTS, 'readonly');
     const store = tx.objectStore(STORE_PROJECTS);
     const req = store.getAll();
@@ -149,6 +233,36 @@ export async function listSavedProjects(): Promise<RayanProject[]> {
     };
     req.onerror = () => reject(req.error);
   });
+
+  // Hydrate any assets whose binary buffer lives in STORE_ASSETS
+  return Promise.all(projects.map((proj) => hydrateProjectAssetsFromDb(proj)));
+}
+
+export async function hydrateProjectAssetsFromDb(project: RayanProject): Promise<RayanProject> {
+  if (!project.assets || project.assets.length === 0) return project;
+  let changed = false;
+  const hydratedAssets = await Promise.all(
+    project.assets.map(async (asset) => {
+      if (asset.dataUrl && !asset.dataUrl.startsWith('idb://')) {
+        return asset;
+      }
+      try {
+        const stored = await getAssetFromDb(asset.id);
+        if (stored) {
+          changed = true;
+          return {
+            ...asset,
+            dataUrl: stored.dataUrl || arrayBufferToDataUrl(stored.buffer),
+            storedInIdb: true,
+          };
+        }
+      } catch {
+        // ignore missing record
+      }
+      return asset;
+    })
+  );
+  return changed ? { ...project, assets: hydratedAssets } : project;
 }
 
 export async function saveProjectToDb(project: RayanProject): Promise<RayanProject> {

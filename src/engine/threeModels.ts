@@ -17,7 +17,14 @@ import { USDLoader } from 'three/addons/loaders/USDLoader.js';
 import { PLYLoader } from 'three/addons/loaders/PLYLoader.js';
 import { WebIO } from '@gltf-transform/core';
 import { ALL_EXTENSIONS } from '@gltf-transform/extensions';
-import type { Model3DPresetType, RayanAsset, Model3DMetadata } from '../types/studio';
+import type {
+  AssetFormat,
+  Model3DPresetType,
+  Primitive3DType,
+  RayanAsset,
+  Model3DMetadata,
+} from '../types/studio';
+import { getAssetFromDb } from '../storage/projectDb';
 
 export function dataUrlToArrayBuffer(dataUrl: string): ArrayBuffer {
   const base64 = dataUrl.includes(',') ? dataUrl.split(',')[1] : dataUrl;
@@ -157,6 +164,7 @@ export function buildProceduralPresetGroup(
     roughness: 0.42,
     metalness: 0.25,
   });
+  bodyMat.userData.isPrimaryColor = true;
   const darkMetalMat = new THREE.MeshStandardMaterial({
     color: 0x1e293b,
     roughness: 0.25,
@@ -354,6 +362,172 @@ export function buildProceduralPresetGroup(
 }
 
 /**
+ * Builds standard 3D primitives with grounded bottom-center pivot (y = 0) and PBR material.
+ */
+export function buildPrimitive3DGroup(
+  primitive: Primitive3DType,
+  primaryHex: string,
+  roughness = 0.4,
+  metalness = 0.25
+): THREE.Group {
+  const group = new THREE.Group();
+  const mat = new THREE.MeshStandardMaterial({
+    color: new THREE.Color(primaryHex || '#38bdf8'),
+    roughness,
+    metalness,
+    side: primitive === 'plane' ? THREE.DoubleSide : THREE.FrontSide,
+  });
+  mat.userData.isPrimaryColor = true;
+
+  let geo: THREE.BufferGeometry;
+  let yOffset = 0.5;
+
+  switch (primitive) {
+    case 'sphere':
+      geo = new THREE.SphereGeometry(0.55, 32, 24);
+      yOffset = 0.55;
+      break;
+    case 'cylinder':
+      geo = new THREE.CylinderGeometry(0.45, 0.45, 1.1, 28);
+      yOffset = 0.55;
+      break;
+    case 'cone':
+      geo = new THREE.ConeGeometry(0.55, 1.2, 28);
+      yOffset = 0.6;
+      break;
+    case 'torus':
+      geo = new THREE.TorusGeometry(0.45, 0.16, 20, 40);
+      yOffset = 0.61;
+      break;
+    case 'capsule':
+      geo = new THREE.CapsuleGeometry(0.35, 0.6, 12, 24);
+      yOffset = 0.65;
+      break;
+    case 'plane':
+      geo = new THREE.PlaneGeometry(2, 2);
+      yOffset = 0.02;
+      break;
+    case 'box':
+    default:
+      geo = new THREE.BoxGeometry(1, 1, 1);
+      yOffset = 0.5;
+      break;
+  }
+
+  const mesh = new THREE.Mesh(geo, mat);
+  if (primitive === 'plane') {
+    mesh.rotation.x = -Math.PI / 2;
+  }
+  mesh.position.y = yOffset;
+  mesh.castShadow = primitive !== 'plane';
+  mesh.receiveShadow = true;
+  group.add(mesh);
+
+  return group;
+}
+
+/**
+ * Builds an editable PointLight node with a visible studio bulb indicator for selection/gizmos.
+ */
+export function buildLight3DGroup(colorHex: string, intensity = 3): THREE.Group {
+  const group = new THREE.Group();
+  const color = new THREE.Color(colorHex || '#fbbf24');
+
+  const light = new THREE.PointLight(color, intensity, 24, 1.5);
+  light.castShadow = false;
+  group.add(light);
+
+  const bulbGeo = new THREE.SphereGeometry(0.18, 16, 12);
+  const bulbMat = new THREE.MeshStandardMaterial({
+    color,
+    emissive: color,
+    emissiveIntensity: 1.2,
+    roughness: 0.2,
+    metalness: 0.1,
+  });
+  bulbMat.userData.isPrimaryColor = true;
+  const bulb = new THREE.Mesh(bulbGeo, bulbMat);
+  bulb.castShadow = false;
+  bulb.receiveShadow = false;
+  group.add(bulb);
+
+  const haloGeo = new THREE.OctahedronGeometry(0.28, 0);
+  const haloMat = new THREE.MeshBasicMaterial({
+    color,
+    wireframe: true,
+    transparent: true,
+    opacity: 0.65,
+  });
+  haloMat.userData.isPrimaryColor = true;
+  const halo = new THREE.Mesh(haloGeo, haloMat);
+  group.add(halo);
+
+  return group;
+}
+
+/**
+ * Updates primary color & PBR parameters on an existing procedural/primitive/light group cleanly.
+ */
+export function applyColorAndPbrToGroup(
+  group: THREE.Group,
+  colorHex: string,
+  roughness?: number,
+  metalness?: number,
+  lightIntensity?: number
+): void {
+  const color = new THREE.Color(colorHex || '#38bdf8');
+  group.traverse((child) => {
+    if ((child as THREE.PointLight).isPointLight) {
+      const pt = child as THREE.PointLight;
+      pt.color.copy(color);
+      if (typeof lightIntensity === 'number') {
+        pt.intensity = lightIntensity;
+      }
+    }
+    if ((child as THREE.Mesh).isMesh) {
+      const mesh = child as THREE.Mesh;
+      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      mats.forEach((m) => {
+        if (!m || !m.userData?.isPrimaryColor) return;
+        if (m instanceof THREE.MeshStandardMaterial) {
+          m.color.copy(color);
+          if (m.emissive && m.emissiveIntensity > 0.5) {
+            m.emissive.copy(color);
+          }
+          if (typeof roughness === 'number') m.roughness = roughness;
+          if (typeof metalness === 'number') m.metalness = metalness;
+        } else if (m instanceof THREE.MeshBasicMaterial) {
+          m.color.copy(color);
+        }
+      });
+    }
+  });
+}
+
+/**
+ * Disposes all geometries, materials, and textures owned by an Object3D subtree.
+ */
+export function disposeObject3D(obj: THREE.Object3D): void {
+  obj.traverse((child) => {
+    if ((child as THREE.Mesh).isMesh) {
+      const mesh = child as THREE.Mesh;
+      mesh.geometry?.dispose();
+      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      mats.forEach((m) => {
+        if (!m) return;
+        const std = m as THREE.MeshStandardMaterial;
+        std.map?.dispose();
+        std.normalMap?.dispose();
+        std.roughnessMap?.dispose();
+        std.metalnessMap?.dispose();
+        std.emissiveMap?.dispose();
+        m.dispose();
+      });
+    }
+  });
+}
+
+/**
  * Normalizes any loaded 3D object so its bottom rests flush at y = 0 and max dimension = 1.5
  */
 export function normalizeLoadedObject(
@@ -408,29 +582,106 @@ export function normalizeLoadedObject(
 }
 
 /**
- * Loads custom 3D asset supporting:
- * - GLB / glTF (materials, textures, Draco, animations)
- * - FBX (skeleton, bones, skinned mesh, animations)
- * - OBJ (geometry, materials)
- * - STL (solid geometry, normals, PBR material)
- * - USD / USDZ (scenes, complex hierarchical assets)
- * - PLY (point clouds, polygon geometry)
+ * Extracts real geometry, material, texture, skeleton, and animation metrics
+ * directly from a parsed Three.js Object3D hierarchy.
  */
-export async function loadCustom3DAsset(
-  asset: RayanAsset,
-  fallbackColor: string
+export function extractModelStatsFromObject3D(
+  obj: THREE.Object3D,
+  format: AssetFormat,
+  animations: THREE.AnimationClip[] = []
+): Model3DMetadata {
+  let meshCount = 0;
+  let vertexCount = 0;
+  let triangleCount = 0;
+  let nodeCount = 0;
+  let hasSkeleton = false;
+  let hasTextures = false;
+  const materialsSet = new Set<THREE.Material>();
+
+  obj.traverse((child) => {
+    nodeCount += 1;
+    if ((child as THREE.Bone).isBone || (child as THREE.SkinnedMesh).isSkinnedMesh) {
+      hasSkeleton = true;
+    }
+    if ((child as THREE.Mesh).isMesh) {
+      meshCount += 1;
+      const mesh = child as THREE.Mesh;
+      const geo = mesh.geometry;
+      if (geo) {
+        const pos = geo.getAttribute('position');
+        if (pos) {
+          vertexCount += pos.count;
+        }
+        if (geo.index) {
+          triangleCount += geo.index.count / 3;
+        } else if (pos) {
+          triangleCount += pos.count / 3;
+        }
+      }
+      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      mats.forEach((m) => {
+        if (!m) return;
+        materialsSet.add(m);
+        const std = m as THREE.MeshStandardMaterial;
+        if (std.map || std.normalMap || std.roughnessMap || std.metalnessMap || std.emissiveMap) {
+          hasTextures = true;
+        }
+      });
+    }
+  });
+
+  const clips =
+    animations.length > 0
+      ? animations
+      : ((obj.userData?.animations as THREE.AnimationClip[] | undefined) || []);
+
+  return {
+    format,
+    nodeCount,
+    meshCount,
+    vertexCount: Math.round(vertexCount),
+    triangleCount: Math.round(triangleCount),
+    materialCount: materialsSet.size,
+    animationCount: clips.length,
+    animationNames: clips.map((c) => c.name || 'Animation'),
+    hasSkeleton: hasSkeleton || Boolean(obj.userData?.hasSkeleton),
+    hasTextures,
+  };
+}
+
+/**
+ * Parses an ArrayBuffer into a normalized Three.js Group using the appropriate real Three.js Loader.
+ */
+export async function parse3DModelBuffer(
+  buffer: ArrayBuffer,
+  formatRaw: string,
+  fallbackColor = '#38bdf8'
 ): Promise<THREE.Group> {
-  const format = asset.format.toLowerCase();
+  const format = formatRaw.toLowerCase();
+  if (!buffer || buffer.byteLength === 0) {
+    throw new Error('فایل مدل سه‌بعدی خالی است.');
+  }
 
   // 1. GLB / glTF
   if (format === 'glb' || format === 'gltf') {
     const loader = new GLTFLoader();
     loader.setDRACOLoader(getDracoLoader());
-    const buffer = dataUrlToArrayBuffer(asset.dataUrl);
+
+    const bytes = new Uint8Array(buffer);
+    const isGlb =
+      bytes.length >= 4 &&
+      bytes[0] === 0x67 &&
+      bytes[1] === 0x6c &&
+      bytes[2] === 0x54 &&
+      bytes[3] === 0x46;
+
+    const parseInput: ArrayBuffer | string = isGlb
+      ? buffer
+      : new TextDecoder().decode(bytes);
 
     return new Promise((resolve, reject) => {
       loader.parse(
-        buffer,
+        parseInput,
         '',
         (gltf) => {
           const group = normalizeLoadedObject(gltf.scene, {
@@ -439,7 +690,7 @@ export async function loadCustom3DAsset(
           });
           resolve(group);
         },
-        (err) => reject(err)
+        (err) => reject(err instanceof Error ? err : new Error(String(err)))
       );
     });
   }
@@ -447,26 +698,28 @@ export async function loadCustom3DAsset(
   // 2. FBX (Skeletal animation, rigs, meshes)
   if (format === 'fbx') {
     const loader = new FBXLoader();
-    const buffer = dataUrlToArrayBuffer(asset.dataUrl);
     const fbxObj = loader.parse(buffer, '');
-
-    const group = normalizeLoadedObject(fbxObj, {
+    return normalizeLoadedObject(fbxObj, {
       animations: fbxObj.animations || [],
       format: 'FBX',
     });
-    return group;
   }
 
   // 3. OBJ (Geometry + Materials)
   if (format === 'obj') {
     const loader = new OBJLoader();
-    const text = dataUrlToText(asset.dataUrl);
+    const text = new TextDecoder().decode(new Uint8Array(buffer));
     const obj = loader.parse(text);
 
+    let meshCount = 0;
     obj.traverse((child) => {
       if ((child as THREE.Mesh).isMesh) {
+        meshCount += 1;
         const mesh = child as THREE.Mesh;
-        if (!mesh.material || Array.isArray(mesh.material) && mesh.material.length === 0) {
+        if (mesh.geometry && !mesh.geometry.getAttribute('normal')) {
+          mesh.geometry.computeVertexNormals();
+        }
+        if (!mesh.material || (Array.isArray(mesh.material) && mesh.material.length === 0)) {
           mesh.material = new THREE.MeshStandardMaterial({
             color: fallbackColor,
             roughness: 0.5,
@@ -475,14 +728,20 @@ export async function loadCustom3DAsset(
         }
       }
     });
+    if (meshCount === 0) {
+      throw new Error('فایل OBJ فاقد هندسه یا مش قابل نمایش است.');
+    }
     return normalizeLoadedObject(obj, { format: 'OBJ' });
   }
 
   // 4. STL (Geometric models)
   if (format === 'stl') {
     const loader = new STLLoader();
-    const buffer = dataUrlToArrayBuffer(asset.dataUrl);
     const geometry = loader.parse(buffer);
+    const pos = geometry.getAttribute('position');
+    if (!pos || pos.count === 0) {
+      throw new Error('فایل STL فاقد مثلث یا رأس معتبر است.');
+    }
     geometry.computeVertexNormals();
 
     const mesh = new THREE.Mesh(
@@ -499,26 +758,20 @@ export async function loadCustom3DAsset(
   // 5. USD / USDZ (Universal Scene Description - Complex assets)
   if (format === 'usd' || format === 'usdz') {
     const loader = new USDLoader();
-    const buffer = dataUrlToArrayBuffer(asset.dataUrl);
-
-    return new Promise((resolve, reject) => {
-      try {
-        const usdGroup = loader.parse(buffer);
-        const group = normalizeLoadedObject(usdGroup, {
-          format: format.toUpperCase(),
-        });
-        resolve(group);
-      } catch (err) {
-        reject(err);
-      }
+    const usdGroup = loader.parse(buffer);
+    return normalizeLoadedObject(usdGroup, {
+      format: format.toUpperCase(),
     });
   }
 
   // 6. PLY
   if (format === 'ply') {
     const loader = new PLYLoader();
-    const buffer = dataUrlToArrayBuffer(asset.dataUrl);
     const geometry = loader.parse(buffer);
+    const pos = geometry.getAttribute('position');
+    if (!pos || pos.count === 0) {
+      throw new Error('فایل PLY فاقد داده‌های هندسی معتبر است.');
+    }
     geometry.computeVertexNormals();
     const hasColors = Boolean(geometry.getAttribute('color'));
     const mesh = new THREE.Mesh(
@@ -533,5 +786,64 @@ export async function loadCustom3DAsset(
     return normalizeLoadedObject(mesh, { format: 'PLY' });
   }
 
-  return buildProceduralPresetGroup('crate', fallbackColor);
+  throw new Error(`فرمت مدل «${format}» پشتیبانی نمی‌شود.`);
 }
+
+/**
+ * Parses and validates a newly imported 3D model file buffer and returns both the
+ * Three.js Group object and real extracted Model3DMetadata.
+ */
+export async function parseAndInspect3DModelFile(
+  buffer: ArrayBuffer,
+  format: AssetFormat,
+  fallbackColor = '#38bdf8'
+): Promise<{ object: THREE.Group; meta: Model3DMetadata }> {
+  const object = await parse3DModelBuffer(buffer, format, fallbackColor);
+  const baseStats = extractModelStatsFromObject3D(object, format);
+
+  if (format === 'glb' || format === 'gltf') {
+    const gltfMeta = await inspectGLTFMetadata(buffer);
+    return {
+      object,
+      meta: {
+        ...baseStats,
+        ...gltfMeta,
+        format,
+        vertexCount: gltfMeta.vertexCount ?? baseStats.vertexCount,
+        triangleCount: gltfMeta.triangleCount ?? baseStats.triangleCount,
+        meshCount: gltfMeta.meshCount ?? baseStats.meshCount,
+        materialCount: gltfMeta.materialCount ?? baseStats.materialCount,
+      },
+    };
+  }
+
+  return { object, meta: baseStats };
+}
+
+/**
+ * Loads custom 3D asset from either its in-memory DataURL or IndexedDB binary record.
+ */
+export async function loadCustom3DAsset(
+  asset: RayanAsset,
+  fallbackColor: string
+): Promise<THREE.Group> {
+  let buffer: ArrayBuffer | null = null;
+
+  if (asset.dataUrl && !asset.dataUrl.startsWith('idb://')) {
+    buffer = dataUrlToArrayBuffer(asset.dataUrl);
+  } else {
+    const record = await getAssetFromDb(asset.id);
+    if (record?.buffer) {
+      buffer = record.buffer;
+    } else if (record?.dataUrl) {
+      buffer = dataUrlToArrayBuffer(record.dataUrl);
+    }
+  }
+
+  if (!buffer) {
+    throw new Error(`داده‌های باینری مدل «${asset.name}» در حافظه یا IndexedDB یافت نشد.`);
+  }
+
+  return parse3DModelBuffer(buffer, asset.format, fallbackColor);
+}
+

@@ -53,11 +53,44 @@ export interface RayanAsset {
   name: string;
   kind: AssetKind;
   format: AssetFormat;
-  /** Data URL for images & audio, or base64 for binary 3D models */
+  /** Data URL for images & audio, or base64 / idb reference for binary 3D models */
   dataUrl: string;
   sizeBytes: number;
   createdAt: number;
   modelMeta?: Model3DMetadata;
+  storedInIdb?: boolean;
+}
+
+export type Primitive3DType =
+  | 'box'
+  | 'sphere'
+  | 'cylinder'
+  | 'cone'
+  | 'torus'
+  | 'capsule'
+  | 'plane';
+
+export interface SceneNode3D {
+  id: string;
+  name: string;
+  kind: 'model-asset' | 'model-preset' | 'primitive' | 'group' | 'light';
+  preset?: Model3DPresetType;
+  primitiveType?: Primitive3DType;
+  assetId?: string;
+  format?: string;
+  position: [number, number, number];
+  rotation: [number, number, number]; // Euler angles in degrees
+  scale: [number, number, number];
+  color: string;
+  roughness?: number;
+  metalness?: number;
+  lightIntensity?: number;
+  visible: boolean;
+  locked: boolean;
+  parentId?: string | null;
+  layerId: string;
+  folder?: string;
+  animations?: string[];
 }
 
 export type EntityRole =
@@ -319,6 +352,8 @@ export interface RayanProject {
   engineMode: EngineMode;
   screenConfig: ScreenConfig;
   assets: RayanAsset[];
+  /** Multi-model 3D Studio Layout nodes persisted with project */
+  studio3dNodes?: SceneNode3D[];
   /** Custom code files (.js, .ts, .css, .html, .json, etc.) */
   codeFiles?: CodeFileItem[];
   /** Mirrors the active scene for convenience & backward compatibility */

@@ -3,6 +3,7 @@ import type { EngineMode, RayanAsset, RayanProject } from './types/studio';
 import {
   createStarter2DProject,
   createStarter3DProject,
+  deleteAssetFromDb,
   deleteProjectFromDb,
   listSavedProjects,
   normalizeProject,
@@ -100,7 +101,7 @@ export default function App() {
   }, []);
 
   const handleUpdateActiveProject = useCallback(
-    (updater: (prev: RayanProject) => RayanProject, skipHistory = false) => {
+    (updater: (prev: RayanProject) => RayanProject, skipHistory = false, persistNow = false) => {
       setActiveProject((current) => {
         if (!current) return current;
         if (!skipHistory) {
@@ -110,7 +111,17 @@ export default function App() {
         }
         const updated = synchronizeActiveScene(updater(current));
         setProjects((list) => list.map((p) => (p.id === updated.id ? updated : p)));
-        setSavingState('idle');
+        if (persistNow) {
+          setSavingState('saving');
+          void saveProjectToDb(updated)
+            .then(() => {
+              setSavingState('saved');
+              setTimeout(() => setSavingState('idle'), 1500);
+            })
+            .catch(() => setSavingState('idle'));
+        } else {
+          setSavingState('idle');
+        }
         return updated;
       });
     },
@@ -267,46 +278,85 @@ export default function App() {
     }
   };
 
-  const handleSpawnAssetToScene = (asset: RayanAsset) => {
+  const handleSpawnAssetToScene = (
+    asset: RayanAsset,
+    targetView: 'editor' | 'studio3d' = 'editor'
+  ) => {
     if (!activeProject) return;
     const is3D = asset.kind === 'model3d';
-    const id = `ent_${Date.now()}`;
-    handleUpdateActiveProject((prev) => ({
-      ...prev,
-      engineMode: is3D ? '3d' : prev.engineMode,
-      entities: [
-        ...prev.entities,
-        {
-          id,
-          name: asset.name,
-          role: 'prop',
-          kind: is3D ? 'model3d-asset' : 'sprite2d',
-          assetId: asset.id,
-          x: is3D ? 0 : 280,
-          y: is3D ? 0 : 240,
-          z: 0,
-          width: is3D ? 1.5 : 90,
-          height: is3D ? 1.5 : 90,
-          depth: 1.5,
-          rotationX: 0,
-          rotationY: 0,
-          rotationZ: 0,
-          color: '#F8FAFC',
-          opacity: 1,
-          visible: true,
-          physics: {
-            enabled: true,
-            isStatic: false,
-            useGravity: false,
-            mass: 1,
-            bounce: 0.1,
-            friction: 0.85,
-            collider: 'box',
+    const now = Date.now();
+    const id = `ent_${now}_${Math.random().toString(36).slice(2, 5)}`;
+
+    handleUpdateActiveProject(
+      (prev) => {
+        const nextEntities = [
+          ...prev.entities,
+          {
+            id,
+            name: asset.name,
+            role: 'prop' as const,
+            kind: (is3D ? 'model3d-asset' : 'sprite2d') as RayanProject['entities'][number]['kind'],
+            assetId: asset.id,
+            x: is3D ? 0 : 280,
+            y: is3D ? 0 : 240,
+            z: 0,
+            width: is3D ? 1.5 : 90,
+            height: is3D ? 1.5 : 90,
+            depth: 1.5,
+            rotationX: 0,
+            rotationY: 0,
+            rotationZ: 0,
+            color: '#F8FAFC',
+            opacity: 1,
+            visible: true,
+            physics: {
+              enabled: true,
+              isStatic: false,
+              useGravity: false,
+              mass: 1,
+              bounce: 0.1,
+              friction: 0.85,
+              collider: 'box' as const,
+            },
           },
-        },
-      ],
-    }));
-    setActiveTab('editor');
+        ];
+
+        const nextStudio3DNodes = is3D
+          ? [
+              ...(prev.studio3dNodes || []),
+              {
+                id: `node_${id}`,
+                name: asset.name,
+                kind: 'model-asset' as const,
+                assetId: asset.id,
+                format: asset.format.toUpperCase(),
+                position: [0, 0, 0] as [number, number, number],
+                rotation: [0, 0, 0] as [number, number, number],
+                scale: [1, 1, 1] as [number, number, number],
+                color: '#38bdf8',
+                visible: true,
+                locked: false,
+                parentId: null,
+                layerId: 'characters',
+                folder: 'مدل‌های وارد شده',
+                animations: asset.modelMeta?.animationNames,
+              },
+            ]
+          : prev.studio3dNodes;
+
+        return {
+          ...prev,
+          engineMode: is3D ? '3d' : prev.engineMode,
+          entities: nextEntities,
+          studio3dNodes: nextStudio3DNodes,
+          updatedAt: now,
+        };
+      },
+      false,
+      true
+    );
+
+    setActiveTab(is3D && targetView === 'studio3d' ? 'studio3d' : 'editor');
   };
 
   if (loading || !activeProject) {
@@ -402,13 +452,19 @@ export default function App() {
       {activeTab === 'studio3d' && (
         <Studio3DView
           project={activeProject}
-          onUpdateProject={handleUpdateActiveProject}
+          onUpdateProject={(updater, skipHistory) =>
+            handleUpdateActiveProject(updater, skipHistory, true)
+          }
           onAddAsset={(asset) =>
-            handleUpdateActiveProject((prev) => ({
-              ...prev,
-              assets: [asset, ...prev.assets],
-              updatedAt: Date.now(),
-            }))
+            handleUpdateActiveProject(
+              (prev) => ({
+                ...prev,
+                assets: [asset, ...prev.assets],
+                updatedAt: Date.now(),
+              }),
+              false,
+              true
+            )
           }
         />
       )}
@@ -453,19 +509,32 @@ export default function App() {
         <AssetsAudioPanel
           project={activeProject}
           onAddAsset={(asset) =>
-            handleUpdateActiveProject((prev) => ({
-              ...prev,
-              assets: [asset, ...prev.assets],
-              updatedAt: Date.now(),
-            }))
+            handleUpdateActiveProject(
+              (prev) => ({
+                ...prev,
+                assets: [asset, ...prev.assets],
+                updatedAt: Date.now(),
+              }),
+              false,
+              true
+            )
           }
-          onRemoveAsset={(id) =>
-            handleUpdateActiveProject((prev) => ({
-              ...prev,
-              assets: prev.assets.filter((a) => a.id !== id),
-              updatedAt: Date.now(),
-            }))
-          }
+          onRemoveAsset={async (id) => {
+            try {
+              await deleteAssetFromDb(id);
+            } catch {
+              // ignore if missing
+            }
+            handleUpdateActiveProject(
+              (prev) => ({
+                ...prev,
+                assets: prev.assets.filter((a) => a.id !== id),
+                updatedAt: Date.now(),
+              }),
+              false,
+              true
+            );
+          }}
           onSetBackgroundImage={(url) =>
             handleUpdateActiveProject((prev) => ({
               ...prev,

@@ -1,7 +1,10 @@
 import React, { useRef, useState } from 'react';
 import {
   Box,
-  Image as ImageIcon,
+  CheckCircle2,
+  Database,
+  Layers,
+  Loader2,
   Music,
   Plus,
   Trash2,
@@ -11,14 +14,18 @@ import {
 import type { AssetFormat, AssetKind, RayanAsset, RayanProject } from '../types/studio';
 import { audioEngine } from '../engine/audioEngine';
 import { importZipPackage } from '../engine/zipHandler';
-import { inspectGLTFMetadata, dataUrlToArrayBuffer } from '../engine/threeModels';
+import {
+  parseAndInspect3DModelFile,
+  dataUrlToArrayBuffer,
+} from '../engine/threeModels';
+import { saveAssetToDb, arrayBufferToDataUrl } from '../storage/projectDb';
 
 interface AssetsAudioPanelProps {
   project: RayanProject;
-  onAddAsset: (asset: RayanAsset) => void;
-  onRemoveAsset: (id: string) => void;
+  onAddAsset: (asset: RayanAsset) => void | Promise<void>;
+  onRemoveAsset: (id: string) => void | Promise<void>;
   onSetBackgroundImage: (url: string) => void;
-  onSpawnAssetToScene: (asset: RayanAsset) => void;
+  onSpawnAssetToScene: (asset: RayanAsset, targetView?: 'editor' | 'studio3d') => void;
   onUpdateSoundBindings: (bindings: RayanProject['soundBindings']) => void;
 }
 
@@ -58,6 +65,9 @@ export const AssetsAudioPanel: React.FC<AssetsAudioPanelProps> = ({
   onUpdateSoundBindings,
 }) => {
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [uploadNotice, setUploadNotice] = useState<string | null>(null);
+  const [isImporting, setIsImporting] = useState(false);
+  const [autoAddTo3DScene, setAutoAddTo3DScene] = useState(true);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const detectKindAndFormat = (filename: string): { kind: AssetKind; format: AssetFormat } | null => {
@@ -74,61 +84,156 @@ export const AssetsAudioPanel: React.FC<AssetsAudioPanelProps> = ({
     return null;
   };
 
+  const getMimeTypeForFormat = (kind: AssetKind, format: AssetFormat): string => {
+    if (kind === 'image') {
+      if (format === 'svg') return 'image/svg+xml';
+      if (format === 'jpg') return 'image/jpeg';
+      return `image/${format}`;
+    }
+    if (kind === 'audio') {
+      return `audio/${format === 'mp3' ? 'mpeg' : format}`;
+    }
+    if (format === 'glb') return 'model/gltf-binary';
+    if (format === 'gltf') return 'model/gltf+json';
+    return 'application/octet-stream';
+  };
+
   const handleFiles = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
     setUploadError(null);
+    setUploadNotice(null);
+    setIsImporting(true);
 
-    for (const file of Array.from(files)) {
-      if (file.name.toLowerCase().endsWith('.zip')) {
-        try {
-          const res = await importZipPackage(file);
-          res.assets.forEach((a) => onAddAsset(a));
-          if (res.assets.length === 0) {
-            setUploadError(`درون فایل زیپ «${file.name}» تصویر، مدل سه‌بعدی یا فایل صوتی یافت نشد (برای فایل‌های کد از محیط کدنویسی استفاده کنید).`);
+    let lastSpawnedModel: RayanAsset | null = null;
+    let importedCount = 0;
+
+    try {
+      for (const file of Array.from(files)) {
+        if (file.name.toLowerCase().endsWith('.zip')) {
+          try {
+            const res = await importZipPackage(file);
+            if (res.assets.length === 0) {
+              setUploadError(`درون فایل زیپ «${file.name}» تصویر، مدل سه‌بعدی یا فایل صوتی یافت نشد (برای فایل‌های کد از محیط کدنویسی استفاده کنید).`);
+              continue;
+            }
+            for (const zipAsset of res.assets) {
+              const buffer = dataUrlToArrayBuffer(zipAsset.dataUrl);
+              let modelMeta = zipAsset.modelMeta;
+              if (zipAsset.kind === 'model3d') {
+                setUploadNotice(`در حال بارگذاری و اعتبارسنجی هندسه مدل «${zipAsset.name}»...`);
+                const inspected = await parseAndInspect3DModelFile(buffer, zipAsset.format);
+                modelMeta = inspected.meta;
+              }
+              await saveAssetToDb({
+                id: zipAsset.id,
+                name: zipAsset.name,
+                kind: zipAsset.kind,
+                format: zipAsset.format,
+                sizeBytes: zipAsset.sizeBytes,
+                createdAt: zipAsset.createdAt,
+                buffer,
+                dataUrl: zipAsset.dataUrl,
+                modelMeta,
+              });
+              const enriched: RayanAsset = { ...zipAsset, modelMeta, storedInIdb: true };
+              await onAddAsset(enriched);
+              importedCount += 1;
+              if (enriched.kind === 'model3d') {
+                lastSpawnedModel = enriched;
+              }
+            }
+          } catch (err) {
+            setUploadError(
+              `خطا در خواندن یا بارگذاری فایل زیپ «${file.name}»: ${err instanceof Error ? err.message : 'خطای نامشخص'}`
+            );
           }
-        } catch {
-          setUploadError(`خطا در خواندن فایل زیپ «${file.name}».`);
+          continue;
         }
-        continue;
-      }
 
-      const detected = detectKindAndFormat(file.name);
-      if (!detected) {
-        setUploadError(
-          `فرمت فایل «${file.name}» پشتیبانی نمی‌شود. فرمت‌های مجاز: PNG, JPG, SVG, GLB, GLTF, FBX, OBJ, STL, USD, USDZ, PLY, MP3, WAV, OGG, ZIP`
-        );
-        continue;
-      }
+        const detected = detectKindAndFormat(file.name);
+        if (!detected) {
+          setUploadError(
+            `فرمت فایل «${file.name}» پشتیبانی نمی‌شود. فرمت‌های مجاز: PNG, JPG, SVG, GLB, GLTF, FBX, OBJ, STL, USD, USDZ, PLY, MP3, WAV, OGG, ZIP`
+          );
+          continue;
+        }
 
-      const dataUrl = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve(String(reader.result || ''));
-        reader.onerror = () => reject(new Error('خطا در خواندن فایل'));
-        reader.readAsDataURL(file);
-      });
+        // 1. Read real binary ArrayBuffer from disk
+        setUploadNotice(`در حال خواندن فایل «${file.name}» از دیسک...`);
+        const buffer = await file.arrayBuffer();
+        if (!buffer || buffer.byteLength === 0) {
+          setUploadError(`فایل «${file.name}» خالی است یا قابل خواندن نیست.`);
+          continue;
+        }
 
-      let modelMeta = undefined;
-      if (detected.kind === 'model3d' && (detected.format === 'glb' || detected.format === 'gltf')) {
-        try {
-          const buf = dataUrlToArrayBuffer(dataUrl);
-          const meta = await inspectGLTFMetadata(buf);
-          modelMeta = { format: detected.format, ...meta };
-        } catch {
-          // ignore inspection error
+        const mimeType = getMimeTypeForFormat(detected.kind, detected.format);
+        const dataUrl = arrayBufferToDataUrl(buffer, mimeType);
+
+        // 2. For 3D models, genuinely parse & inspect using Three.js Loaders (+ glTF-Transform)
+        let modelMeta = undefined;
+        if (detected.kind === 'model3d') {
+          setUploadNotice(`در حال بارگذاری و تحلیل سه‌بعدی مدل «${file.name}»...`);
+          try {
+            const parsed = await parseAndInspect3DModelFile(buffer, detected.format);
+            modelMeta = parsed.meta;
+          } catch (err) {
+            setUploadError(
+              `بارگذاری مدل سه‌بعدی «${file.name}» ناموفق بود: ${err instanceof Error ? err.message : 'ساختار فایل نامعتبر است'}`
+            );
+            continue;
+          }
+        }
+
+        const assetId = `asset_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        const assetName = file.name.replace(/\.[^.]+$/, '');
+
+        // 3. Persist binary buffer + metadata into IndexedDB
+        setUploadNotice(`در حال ذخیره فایل «${file.name}» در IndexedDB...`);
+        await saveAssetToDb({
+          id: assetId,
+          name: assetName,
+          kind: detected.kind,
+          format: detected.format,
+          sizeBytes: file.size,
+          createdAt: Date.now(),
+          buffer,
+          dataUrl,
+          modelMeta,
+        });
+
+        const asset: RayanAsset = {
+          id: assetId,
+          name: assetName,
+          kind: detected.kind,
+          format: detected.format,
+          dataUrl,
+          sizeBytes: file.size,
+          createdAt: Date.now(),
+          modelMeta,
+          storedInIdb: true,
+        };
+
+        await onAddAsset(asset);
+        importedCount += 1;
+        if (asset.kind === 'model3d') {
+          lastSpawnedModel = asset;
         }
       }
 
-      const asset: RayanAsset = {
-        id: `asset_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-        name: file.name.replace(/\.[^.]+$/, ''),
-        kind: detected.kind,
-        format: detected.format,
-        dataUrl,
-        sizeBytes: file.size,
-        createdAt: Date.now(),
-        modelMeta,
-      };
-      onAddAsset(asset);
+      if (importedCount > 0) {
+        if (autoAddTo3DScene && lastSpawnedModel) {
+          setUploadNotice(
+            `مدل «${lastSpawnedModel.name}» خوانده شد، در IndexedDB ذخیره شد و به صحنه سه‌بعدی اضافه گردید.`
+          );
+          onSpawnAssetToScene(lastSpawnedModel, 'studio3d');
+        } else {
+          setUploadNotice(
+            `${importedCount} فایل با موفقیت خوانده شد، اعتبارسنجی شد و در IndexedDB ذخیره گردید.`
+          );
+        }
+      }
+    } finally {
+      setIsImporting(false);
     }
   };
 
@@ -153,15 +258,24 @@ export const AssetsAudioPanel: React.FC<AssetsAudioPanelProps> = ({
   return (
     <div className="flex-1 overflow-y-auto p-6 lg:p-8 max-w-6xl mx-auto w-full space-y-8">
       {/* File Importer */}
-      <section className="rounded-xl border border-slate-800 bg-[#131822] p-6">
+      <section className="rounded-xl border border-slate-800 bg-[#131822] p-6 space-y-4">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div className="space-y-1">
-            <h2 className="text-lg font-bold text-slate-100">افزودن فایل، تصویر، مدل سه‌بعدی و صدا</h2>
+            <h2 className="text-lg font-bold text-slate-100">افزودن فایل، تصویر، مدل سه‌بعدی و صدا (Import Asset)</h2>
             <p className="text-xs text-slate-400">
-              پشتیبانی واقعی از تصاویر (PNG, JPG, SVG, WebP)، مدل‌های سه‌بعدی (GLB, glTF, FBX, OBJ, STL, USD/USDZ) و فایل‌های صوتی (MP3, WAV, OGG) به صورت آفلاین.
+              خواندن مستقیم فایل از دیسک، بارگذاری واقعی با موتور Three.js (GLB, glTF, FBX, OBJ, STL, USD/USDZ, PLY)، ذخیره دائمی در IndexedDB و ورود مستقیم به صحنه سه‌بعدی.
             </p>
           </div>
-          <div>
+          <div className="flex flex-wrap items-center gap-3">
+            <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={autoAddTo3DScene}
+                onChange={(e) => setAutoAddTo3DScene(e.target.checked)}
+                className="rounded border-slate-700 bg-[#0B0E14] text-amber-500 focus:ring-amber-500"
+              />
+              ورود خودکار مدل به صحنه سه‌بعدی
+            </label>
             <input
               ref={fileInputRef}
               type="file"
@@ -175,17 +289,25 @@ export const AssetsAudioPanel: React.FC<AssetsAudioPanelProps> = ({
             />
             <button
               type="button"
+              disabled={isImporting}
               onClick={() => fileInputRef.current?.click()}
-              className="flex items-center gap-2 px-4 py-2.5 rounded-lg bg-amber-500 text-slate-950 text-xs font-bold hover:bg-amber-400 transition-colors whitespace-nowrap"
+              className="flex items-center gap-2 px-4 py-2.5 rounded-lg bg-amber-500 text-slate-950 text-xs font-bold hover:bg-amber-400 disabled:opacity-60 transition-colors whitespace-nowrap"
             >
-              <Upload className="w-4 h-4" />
-              انتخاب و وارد کردن فایل‌ها
+              {isImporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
+              {isImporting ? 'در حال خواندن و بارگذاری...' : 'Import Asset / انتخاب فایل'}
             </button>
           </div>
         </div>
 
+        {uploadNotice && (
+          <div className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-4 py-2.5 text-xs text-emerald-300 flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 shrink-0" />
+            <span>{uploadNotice}</span>
+          </div>
+        )}
+
         {uploadError && (
-          <div className="mt-4 rounded-lg border border-red-500/40 bg-red-500/10 px-4 py-2.5 text-xs text-red-300">
+          <div className="rounded-lg border border-red-500/40 bg-red-500/10 px-4 py-2.5 text-xs text-red-300">
             {uploadError}
           </div>
         )}
@@ -322,11 +444,26 @@ export const AssetsAudioPanel: React.FC<AssetsAudioPanelProps> = ({
                 <div className="space-y-1 text-xs text-slate-400">
                   <div className="flex items-center justify-between tabular-nums">
                     <span>حجم فایل:</span>
-                    <span>{Math.round(m.sizeBytes / 1024)} کیلوبایت</span>
+                    <span>{Math.max(1, Math.round(m.sizeBytes / 1024))} کیلوبایت</span>
+                  </div>
+                  <div className="flex items-center justify-between text-[11px] text-emerald-400">
+                    <span className="flex items-center gap-1">
+                      <Database className="w-3 h-3" />
+                      ذخیره‌سازی:
+                    </span>
+                    <span>IndexedDB تایید شده</span>
                   </div>
 
                   {m.modelMeta && (
                     <div className="pt-2 border-t border-slate-800/80 space-y-1 text-[11px]">
+                      {m.modelMeta.meshCount !== undefined && (
+                        <div className="flex items-center justify-between text-slate-400">
+                          <span>مش‌ها / متریال‌ها:</span>
+                          <span className="font-mono text-slate-300 tabular-nums">
+                            {m.modelMeta.meshCount} / {m.modelMeta.materialCount ?? 1}
+                          </span>
+                        </div>
+                      )}
                       {m.modelMeta.vertexCount !== undefined && (
                         <div className="flex items-center justify-between text-slate-400">
                           <span>رأس‌ها / مثلث‌ها:</span>
@@ -350,21 +487,32 @@ export const AssetsAudioPanel: React.FC<AssetsAudioPanelProps> = ({
                   )}
                 </div>
 
-                <div className="flex items-center gap-2 pt-1">
+                <div className="flex flex-col gap-1.5 pt-1">
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => onSpawnAssetToScene(m, 'studio3d')}
+                      className="flex-1 flex items-center justify-center gap-1 py-1.5 rounded-lg bg-sky-500/15 text-sky-300 text-xs font-semibold hover:bg-sky-500/25"
+                    >
+                      <Layers className="w-3.5 h-3.5" />
+                      چیدمان چندمدلی 3D
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onRemoveAsset(m.id)}
+                      className="p-1.5 rounded-lg text-slate-400 hover:text-red-400 hover:bg-slate-800"
+                      title="حذف مدل از پروژه و IndexedDB"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
                   <button
                     type="button"
-                    onClick={() => onSpawnAssetToScene(m)}
-                    className="flex-1 flex items-center justify-center gap-1 py-1.5 rounded-lg bg-amber-500/15 text-amber-400 text-xs font-semibold hover:bg-amber-500/25"
+                    onClick={() => onSpawnAssetToScene(m, 'editor')}
+                    className="w-full flex items-center justify-center gap-1 py-1.5 rounded-lg bg-amber-500/15 text-amber-400 text-xs font-semibold hover:bg-amber-500/25"
                   >
                     <Plus className="w-3.5 h-3.5" />
-                    قرار دادن در صحنه سه‌بعدی
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => onRemoveAsset(m.id)}
-                    className="p-1.5 rounded-lg text-slate-400 hover:text-red-400 hover:bg-slate-800"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
+                    افزودن به صحنه بازی (Editor)
                   </button>
                 </div>
               </div>

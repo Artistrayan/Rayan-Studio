@@ -281,15 +281,30 @@ export const Engine3D: React.FC<Engine3DProps> = ({
   const buildSingleEntityMesh = async (ent: GameEntity, currentProject: RayanProject) => {
     let obj3D: THREE.Group;
     if (ent.kind === 'model3d-asset' && ent.assetId) {
-      const asset = currentProject.assets.find((a) => a.id === ent.assetId);
-      if (asset) {
-        try {
-          obj3D = await loadCustom3DAsset(asset, ent.color);
-        } catch {
-          obj3D = buildProceduralPresetGroup('crate', ent.color);
-        }
-      } else {
-        obj3D = buildProceduralPresetGroup('crate', ent.color);
+      const asset = currentProject.assets.find((a) => a.id === ent.assetId) || {
+        id: ent.assetId,
+        name: ent.name,
+        kind: 'model3d' as const,
+        format: 'glb' as const,
+        dataUrl: `idb://${ent.assetId}`,
+        sizeBytes: 0,
+        createdAt: 0,
+        storedInIdb: true,
+      };
+      try {
+        obj3D = await loadCustom3DAsset(asset, ent.color);
+      } catch (err) {
+        const msg = `خطا در بارگذاری مدل «${ent.name}»: ${err instanceof Error ? err.message : 'فایل نامعتبر'}`;
+        logsRef.current = [msg, ...logsRef.current.slice(0, 19)];
+        setBannerMessage(msg);
+        obj3D = new THREE.Group();
+        const errGeo = new THREE.BoxGeometry(1, 1, 1);
+        const errWire = new THREE.LineSegments(
+          new THREE.EdgesGeometry(errGeo),
+          new THREE.LineBasicMaterial({ color: 0xef4444 })
+        );
+        errWire.position.y = 0.5;
+        obj3D.add(errWire);
       }
     } else {
       obj3D = buildProceduralPresetGroup(ent.model3dPreset || 'crate', ent.color);
