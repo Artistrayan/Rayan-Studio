@@ -1,0 +1,6 @@
+{
+  "name": "استودیو بازی‌سازی رایان",
+  "description": "موتور بازی‌سازی بصری دو‌بعدی و سه‌بعدی رایان با شبیه‌ساز فیزیک، قوانین متنی، هوش مصنوعی و خروجی آفلاین برای وب، اندروید و ویندوز.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
