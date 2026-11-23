@@ -36,6 +36,8 @@ import {
 } from 'lucide-react';
 import type {
   AnimationPreset,
+  BoxChildLayer,
+  BoxLayerKind,
   EngineMode,
   EntityKind,
   EntityRole,
@@ -430,6 +432,471 @@ export const SceneEditorWorkspace: React.FC<SceneEditorWorkspaceProps> = ({
         const jumpPower = prev.engineMode === '3d' ? 10 : 540;
         const clickRule = `کلیک روی ${newEnt.name}: ${playerName} پرش قدرت ${jumpPower} | افکت جرقه | صدا click`;
         nextRulesText = nextRulesText.trim() ? `${nextRulesText.trim()}\n${clickRule}` : clickRule;
+      }
+      return {
+        ...prev,
+        entities: nextEntities,
+        rulesText: nextRulesText,
+        rules: parsePersianRules(nextRulesText, nextEntities).rules,
+        updatedAt: Date.now(),
+      };
+    });
+    setEditorTool('select');
+    setSelectedEntityId(id);
+  };
+
+  const addMultiLayerTemplate = (
+    templateId: 'horizontal-shop' | 'dialog-panel' | 'mission-list' | 'hud-bar' | 'scroll-x'
+  ) => {
+    const count = project.entities.length + 1;
+    const now = Date.now();
+    const id = `ent_${now}_${count}`;
+    let newEnt: GameEntity;
+    const autoRules: string[] = [];
+
+    if (templateId === 'scroll-x') {
+      newEnt = {
+        id,
+        name: `اسکرول افقی ${count}`,
+        role: 'text-box',
+        kind: 'text-box',
+        x: 36,
+        y: 88,
+        z: 0,
+        width: 300,
+        height: 76,
+        depth: 10,
+        rotationX: 0,
+        rotationY: 0,
+        rotationZ: 0,
+        color: '#E2E8F0',
+        opacity: 1,
+        visible: true,
+        clickable: false,
+        physics: {
+          enabled: false,
+          isStatic: true,
+          useGravity: false,
+          mass: 1,
+          bounce: 0,
+          friction: 0,
+          collider: 'none',
+        },
+        textConfig: {
+          text: 'نوار اسکرول افقی رایان  ✦  مورد اول: سکه طلایی  ✦  مورد دوم: شمشیر جادویی  ✦  مورد سوم: سپر الماس  ✦  مورد چهارم: اکسیر سرعت  ✦  برای مشاهده بقیه آیتم‌ها به چپ و راست بکشید',
+          fontSize: 14,
+          textColor: '#F8FAFC',
+          boxBgColor: 'rgba(15, 23, 42, 0.88)',
+          boxBorderColor: '#38BDF8',
+          boxBorderWidth: 1,
+          boxBorderRadius: 10,
+          boxPadding: 12,
+          scrollable: false,
+          scrollableX: true,
+          fixedOnScreen: true,
+          clickable: false,
+          align: 'right',
+        },
+      };
+    } else if (templateId === 'horizontal-shop') {
+      const btn1 = `خرید سپر ${count}`;
+      const btn2 = `خرید سرعت ${count}`;
+      const btn3 = `خرید جان ${count}`;
+      const children: BoxChildLayer[] = [
+        {
+          id: `lyr_${now}_1`,
+          name: `کارت سپر`,
+          kind: 'card',
+          text: 'سپر محافظ\nهزینه: ۱۰ امتیاز',
+          color: '#F8FAFC',
+          bgColor: 'rgba(30, 41, 59, 0.9)',
+          borderColor: '#38BDF8',
+          width: 145,
+          visible: true,
+        },
+        {
+          id: `lyr_${now}_2`,
+          name: btn1,
+          kind: 'button',
+          text: 'خرید سپر (+۱ موج)',
+          color: '#0B0E14',
+          bgColor: '#38BDF8',
+          borderColor: '#7DD3FC',
+          clickable: true,
+          visible: true,
+        },
+        {
+          id: `lyr_${now}_3`,
+          name: `کارت سرعت`,
+          kind: 'card',
+          text: 'اکسیر سرعت\nافزایش امتیاز +۲۰',
+          color: '#F8FAFC',
+          bgColor: 'rgba(30, 41, 59, 0.9)',
+          borderColor: '#F59E0B',
+          width: 145,
+          visible: true,
+        },
+        {
+          id: `lyr_${now}_4`,
+          name: btn2,
+          kind: 'button',
+          text: 'دریافت جایزه',
+          color: '#0B0E14',
+          bgColor: '#F59E0B',
+          borderColor: '#FCD34D',
+          clickable: true,
+          visible: true,
+        },
+        {
+          id: `lyr_${now}_5`,
+          name: btn3,
+          kind: 'button',
+          text: 'افزایش جان (+۲۵)',
+          color: '#0B0E14',
+          bgColor: '#10B981',
+          borderColor: '#6EE7B7',
+          clickable: true,
+          visible: true,
+        },
+      ];
+      autoRules.push(
+        `کلیک روی ${btn1}: امتیاز +10 | افکت جرقه | صدا coin`,
+        `کلیک روی ${btn2}: امتیاز +20 | افکت جرقه | صدا coin`,
+        `کلیک روی ${btn3}: جان +25 | افکت جرقه | صدا coin`
+      );
+      newEnt = {
+        id,
+        name: `فروشگاه افقی ${count}`,
+        role: 'text-box',
+        kind: 'text-box',
+        x: 32,
+        y: 86,
+        z: 0,
+        width: 360,
+        height: 112,
+        depth: 10,
+        rotationX: 0,
+        rotationY: 0,
+        rotationZ: 0,
+        color: '#F8FAFC',
+        opacity: 1,
+        visible: true,
+        clickable: false,
+        physics: {
+          enabled: false,
+          isStatic: true,
+          useGravity: false,
+          mass: 1,
+          bounce: 0,
+          friction: 0,
+          collider: 'none',
+        },
+        textConfig: {
+          text: '',
+          fontSize: 13,
+          textColor: '#F8FAFC',
+          boxBgColor: 'rgba(11, 14, 20, 0.9)',
+          boxBorderColor: '#475569',
+          boxBorderWidth: 1,
+          boxBorderRadius: 12,
+          boxPadding: 10,
+          scrollable: false,
+          scrollableX: true,
+          fixedOnScreen: true,
+          clickable: false,
+          align: 'right',
+          layoutDirection: 'horizontal',
+          childGap: 10,
+          children,
+        },
+      };
+    } else if (templateId === 'dialog-panel') {
+      const btnName = `دکمه ادامه ${count}`;
+      const children: BoxChildLayer[] = [
+        {
+          id: `lyr_${now}_1`,
+          name: 'نشان گفتگو',
+          kind: 'badge',
+          text: 'پیام راهنما · مرحله {level}',
+          color: '#0B0E14',
+          bgColor: '#FBBF24',
+          borderColor: '#FDE68A',
+          fontSize: 11,
+          visible: true,
+        },
+        {
+          id: `lyr_${now}_2`,
+          name: 'متن داستان',
+          kind: 'text',
+          text: 'سلام قهرمان! سکه‌ها را جمع کن و از تله‌ها عبور کن تا به پرچم پایان برسی.',
+          color: '#E2E8F0',
+          bgColor: 'rgba(15, 23, 42, 0.5)',
+          borderColor: '#334155',
+          visible: true,
+        },
+        {
+          id: `lyr_${now}_3`,
+          name: 'خط جداکننده',
+          kind: 'divider',
+          text: '',
+          color: '#334155',
+          bgColor: 'transparent',
+          borderColor: '#334155',
+          visible: true,
+        },
+        {
+          id: `lyr_${now}_4`,
+          name: btnName,
+          kind: 'button',
+          text: 'تایید و دریافت +۱۰ امتیاز',
+          color: '#0B0E14',
+          bgColor: '#10B981',
+          borderColor: '#6EE7B7',
+          clickable: true,
+          visible: true,
+        },
+      ];
+      autoRules.push(`کلیک روی ${btnName}: امتیاز +10 | افکت جرقه | صدا coin`);
+      newEnt = {
+        id,
+        name: `پنل گفتگو ${count}`,
+        role: 'text-box',
+        kind: 'text-box',
+        x: 34,
+        y: 84,
+        z: 0,
+        width: 310,
+        height: 196,
+        depth: 10,
+        rotationX: 0,
+        rotationY: 0,
+        rotationZ: 0,
+        color: '#F8FAFC',
+        opacity: 1,
+        visible: true,
+        clickable: false,
+        physics: {
+          enabled: false,
+          isStatic: true,
+          useGravity: false,
+          mass: 1,
+          bounce: 0,
+          friction: 0,
+          collider: 'none',
+        },
+        textConfig: {
+          text: '',
+          fontSize: 13,
+          textColor: '#F8FAFC',
+          boxBgColor: 'rgba(15, 23, 42, 0.92)',
+          boxBorderColor: '#F59E0B',
+          boxBorderWidth: 1,
+          boxBorderRadius: 12,
+          boxPadding: 12,
+          scrollable: true,
+          scrollableX: false,
+          fixedOnScreen: true,
+          clickable: false,
+          align: 'right',
+          layoutDirection: 'vertical',
+          childGap: 8,
+          children,
+        },
+      };
+    } else if (templateId === 'mission-list') {
+      const saveBtn = `دکمه ذخیره ${count}`;
+      const children: BoxChildLayer[] = [
+        {
+          id: `lyr_${now}_1`,
+          name: 'نشان ماموریت',
+          kind: 'badge',
+          text: 'ماموریت‌های مرحله {level}',
+          color: '#E0F2FE',
+          bgColor: 'rgba(14, 165, 233, 0.25)',
+          borderColor: '#38BDF8',
+          fontSize: 12,
+          visible: true,
+        },
+        {
+          id: `lyr_${now}_2`,
+          name: 'ماموریت اول',
+          kind: 'card',
+          text: '۱. جمع‌آوری امتیاز فعلی: {score}\n۲. حفظ سلامت بازیکن: {health}',
+          color: '#E2E8F0',
+          bgColor: 'rgba(30, 41, 59, 0.85)',
+          borderColor: '#475569',
+          visible: true,
+        },
+        {
+          id: `lyr_${now}_3`,
+          name: 'ماموریت دوم',
+          kind: 'card',
+          text: '۳. زمان سپری‌شده: {time} ثانیه\n۴. رسیدن به پرچم پایان مرحله',
+          color: '#CBD5E1',
+          bgColor: 'rgba(30, 41, 59, 0.65)',
+          borderColor: '#334155',
+          visible: true,
+        },
+        {
+          id: `lyr_${now}_4`,
+          name: saveBtn,
+          kind: 'button',
+          text: 'ذخیره پیشرفت بازی',
+          color: '#0B0E14',
+          bgColor: '#F59E0B',
+          borderColor: '#FCD34D',
+          clickable: true,
+          visible: true,
+        },
+      ];
+      autoRules.push(`کلیک روی ${saveBtn}: ذخیره پیشرفت | نمایش پیام "پیشرفت ذخیره شد!" | صدا click`);
+      newEnt = {
+        id,
+        name: `لیست ماموریت ${count}`,
+        role: 'text-box',
+        kind: 'text-box',
+        x: 920,
+        y: 155,
+        z: 0,
+        width: 300,
+        height: 220,
+        depth: 10,
+        rotationX: 0,
+        rotationY: 0,
+        rotationZ: 0,
+        color: '#F8FAFC',
+        opacity: 1,
+        visible: true,
+        clickable: false,
+        physics: {
+          enabled: false,
+          isStatic: true,
+          useGravity: false,
+          mass: 1,
+          bounce: 0,
+          friction: 0,
+          collider: 'none',
+        },
+        textConfig: {
+          text: '',
+          fontSize: 13,
+          textColor: '#F8FAFC',
+          boxBgColor: 'rgba(11, 14, 20, 0.9)',
+          boxBorderColor: '#38BDF8',
+          boxBorderWidth: 1,
+          boxBorderRadius: 12,
+          boxPadding: 10,
+          scrollable: true,
+          scrollableX: false,
+          fixedOnScreen: true,
+          clickable: false,
+          align: 'right',
+          layoutDirection: 'vertical',
+          childGap: 8,
+          children,
+        },
+      };
+    } else {
+      const helpBtn = `دکمه راهنما ${count}`;
+      const children: BoxChildLayer[] = [
+        {
+          id: `lyr_${now}_1`,
+          name: 'نشان امتیاز',
+          kind: 'badge',
+          text: 'امتیاز: {score}',
+          color: '#0B0E14',
+          bgColor: '#FBBF24',
+          borderColor: '#FDE68A',
+          visible: true,
+        },
+        {
+          id: `lyr_${now}_2`,
+          name: 'نشان جان',
+          kind: 'badge',
+          text: 'جان: {health}',
+          color: '#FFFFFF',
+          bgColor: '#EF4444',
+          borderColor: '#FCA5A5',
+          visible: true,
+        },
+        {
+          id: `lyr_${now}_3`,
+          name: 'نشان مرحله',
+          kind: 'badge',
+          text: 'مرحله: {level}',
+          color: '#0B0E14',
+          bgColor: '#38BDF8',
+          borderColor: '#7DD3FC',
+          visible: true,
+        },
+        {
+          id: `lyr_${now}_4`,
+          name: helpBtn,
+          kind: 'button',
+          text: 'پیام راهنما',
+          color: '#F8FAFC',
+          bgColor: '#334155',
+          borderColor: '#64748B',
+          clickable: true,
+          visible: true,
+        },
+      ];
+      autoRules.push(`کلیک روی ${helpBtn}: نمایش پیام "با کلیدهای جهت و فاصله حرکت و پرش کنید!" | صدا click`);
+      newEnt = {
+        id,
+        name: `نوار وضعیت ${count}`,
+        role: 'text-box',
+        kind: 'text-box',
+        x: 24,
+        y: 78,
+        z: 0,
+        width: 440,
+        height: 60,
+        depth: 10,
+        rotationX: 0,
+        rotationY: 0,
+        rotationZ: 0,
+        color: '#F8FAFC',
+        opacity: 1,
+        visible: true,
+        clickable: false,
+        physics: {
+          enabled: false,
+          isStatic: true,
+          useGravity: false,
+          mass: 1,
+          bounce: 0,
+          friction: 0,
+          collider: 'none',
+        },
+        textConfig: {
+          text: '',
+          fontSize: 13,
+          textColor: '#F8FAFC',
+          boxBgColor: 'rgba(11, 14, 20, 0.88)',
+          boxBorderColor: '#334155',
+          boxBorderWidth: 1,
+          boxBorderRadius: 12,
+          boxPadding: 8,
+          scrollable: false,
+          scrollableX: true,
+          fixedOnScreen: true,
+          clickable: false,
+          align: 'center',
+          layoutDirection: 'horizontal',
+          childGap: 8,
+          children,
+        },
+      };
+    }
+
+    onUpdateProject((prev) => {
+      const nextEntities = [...prev.entities, newEnt];
+      let nextRulesText = prev.rulesText;
+      if (autoRules.length > 0) {
+        nextRulesText = nextRulesText.trim()
+          ? `${nextRulesText.trim()}\n${autoRules.join('\n')}`
+          : autoRules.join('\n');
       }
       return {
         ...prev,
@@ -1101,7 +1568,15 @@ export const SceneEditorWorkspace: React.FC<SceneEditorWorkspaceProps> = ({
                   className="flex items-center gap-1 px-2 py-1.5 rounded-md bg-[#0B0E14] border border-slate-800 text-xs text-slate-300 hover:border-slate-600"
                 >
                   <Plus className="w-3 h-3 text-emerald-400" />
-                  کادر اسکرول
+                  اسکرول عمودی
+                </button>
+                <button
+                  type="button"
+                  onClick={() => addMultiLayerTemplate('scroll-x')}
+                  className="flex items-center gap-1 px-2 py-1.5 rounded-md bg-[#0B0E14] border border-slate-800 text-xs text-slate-300 hover:border-sky-400/60"
+                >
+                  <Plus className="w-3 h-3 text-sky-400" />
+                  اسکرول افقی
                 </button>
                 <button
                   type="button"
@@ -1116,11 +1591,47 @@ export const SceneEditorWorkspace: React.FC<SceneEditorWorkspaceProps> = ({
                       clickable: true,
                     })
                   }
-                  className="col-span-2 flex items-center justify-center gap-1 px-2 py-1.5 rounded-md bg-[#0B0E14] border border-slate-800 text-xs text-slate-300 hover:border-amber-500/60"
+                  className="flex items-center gap-1 px-2 py-1.5 rounded-md bg-[#0B0E14] border border-slate-800 text-xs text-slate-300 hover:border-amber-500/60"
                 >
                   <Plus className="w-3 h-3 text-amber-400" />
-                  دکمه کلیکی تعاملی
+                  دکمه کلیکی
                 </button>
+              </div>
+
+              <div className="pt-2 border-t border-slate-800/70 space-y-1.5">
+                <div className="text-[11px] font-semibold text-amber-300/90">
+                  قالب‌های آماده کادر چندلایه:
+                </div>
+                <div className="grid grid-cols-2 gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => addMultiLayerTemplate('horizontal-shop')}
+                    className="px-2 py-1.5 rounded-md bg-[#0B0E14] border border-slate-800 text-[11px] text-sky-300 hover:border-sky-400/60 text-right truncate"
+                  >
+                    + فروشگاه افقی
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => addMultiLayerTemplate('dialog-panel')}
+                    className="px-2 py-1.5 rounded-md bg-[#0B0E14] border border-slate-800 text-[11px] text-amber-300 hover:border-amber-400/60 text-right truncate"
+                  >
+                    + پنل گفتگو
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => addMultiLayerTemplate('mission-list')}
+                    className="px-2 py-1.5 rounded-md bg-[#0B0E14] border border-slate-800 text-[11px] text-emerald-300 hover:border-emerald-400/60 text-right truncate"
+                  >
+                    + لیست ماموریت
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => addMultiLayerTemplate('hud-bar')}
+                    className="px-2 py-1.5 rounded-md bg-[#0B0E14] border border-slate-800 text-[11px] text-indigo-300 hover:border-indigo-400/60 text-right truncate"
+                  >
+                    + نوار HUD
+                  </button>
+                </div>
               </div>
             </div>
 
@@ -1784,6 +2295,30 @@ export const SceneEditorWorkspace: React.FC<SceneEditorWorkspaceProps> = ({
                         <label className="flex items-center gap-2 text-slate-300 cursor-pointer">
                           <input
                             type="checkbox"
+                            checked={Boolean(selectedEntity.textConfig.scrollableX)}
+                            onChange={(e) => {
+                              const checked = e.target.checked;
+                              const curText = selectedEntity.textConfig!.text || '';
+                              const hasChildren = (selectedEntity.textConfig!.children?.length || 0) > 0;
+                              const nextText =
+                                checked && !hasChildren && curText.length < 48
+                                  ? `${curText}  ✦  آیتم اول: توضیحات گسترده برای اسکرول افقی  ✦  آیتم دوم: چپ و راست بکشید  ✦  آیتم سوم: انتهای کادر`
+                                  : curText;
+                              updateEntity(selectedEntity.id, {
+                                width: checked && selectedEntity.width < 220 ? 260 : selectedEntity.width,
+                                textConfig: {
+                                  ...selectedEntity.textConfig!,
+                                  scrollableX: checked,
+                                  text: nextText,
+                                },
+                              });
+                            }}
+                          />
+                          <span>قابلیت اسکرول افقی (چپ و راست)</span>
+                        </label>
+                        <label className="flex items-center gap-2 text-slate-300 cursor-pointer">
+                          <input
+                            type="checkbox"
                             checked={selectedEntity.textConfig.clickable}
                             onChange={(e) =>
                               updateEntity(selectedEntity.id, {
@@ -1849,6 +2384,379 @@ export const SceneEditorWorkspace: React.FC<SceneEditorWorkspaceProps> = ({
                           </div>
                         </div>
                       )}
+
+                      {/* Nested Multi-Layer Children Inside Box */}
+                      <div className="pt-3 border-t border-slate-800 space-y-2.5">
+                        <div className="flex items-center justify-between">
+                          <h5 className="font-bold text-sky-300 text-xs">
+                            لایه‌های داخل کادر ({selectedEntity.textConfig.children?.length || 0})
+                          </h5>
+                          <div className="flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                updateEntity(selectedEntity.id, {
+                                  textConfig: {
+                                    ...selectedEntity.textConfig!,
+                                    layoutDirection: 'vertical',
+                                  },
+                                })
+                              }
+                              className={`px-2 py-0.5 rounded text-[10px] border ${
+                                (selectedEntity.textConfig.layoutDirection || 'vertical') === 'vertical'
+                                  ? 'border-sky-400 bg-sky-500/20 text-sky-200'
+                                  : 'border-slate-700 bg-[#0B0E14] text-slate-400'
+                              }`}
+                            >
+                              چیدمان عمودی
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                updateEntity(selectedEntity.id, {
+                                  textConfig: {
+                                    ...selectedEntity.textConfig!,
+                                    layoutDirection: 'horizontal',
+                                  },
+                                })
+                              }
+                              className={`px-2 py-0.5 rounded text-[10px] border ${
+                                selectedEntity.textConfig.layoutDirection === 'horizontal'
+                                  ? 'border-sky-400 bg-sky-500/20 text-sky-200'
+                                  : 'border-slate-700 bg-[#0B0E14] text-slate-400'
+                              }`}
+                            >
+                              چیدمان افقی
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-2 items-center">
+                          <label className="text-[11px] text-slate-400">فاصله بین لایه‌ها (px)</label>
+                          <NumericInput
+                            min={0}
+                            max={48}
+                            value={selectedEntity.textConfig.childGap ?? 8}
+                            onChange={(val) =>
+                              updateEntity(selectedEntity.id, {
+                                textConfig: {
+                                  ...selectedEntity.textConfig!,
+                                  childGap: val,
+                                },
+                              })
+                            }
+                            className="w-full px-2 py-1 rounded border border-slate-700 bg-[#0B0E14] text-slate-100 text-center font-mono"
+                          />
+                        </div>
+
+                        <div className="flex flex-wrap gap-1">
+                          {(
+                            [
+                              { kind: 'text', label: 'متن' },
+                              { kind: 'card', label: 'کارت' },
+                              { kind: 'button', label: 'دکمه' },
+                              { kind: 'image', label: 'تصویر' },
+                              { kind: 'badge', label: 'نشان' },
+                              { kind: 'divider', label: 'خط' },
+                            ] as Array<{ kind: BoxLayerKind; label: string }>
+                          ).map((item) => (
+                            <button
+                              key={item.kind}
+                              type="button"
+                              onClick={() => {
+                                const cur = selectedEntity.textConfig!.children || [];
+                                const idxNum = cur.length + 1;
+                                const newLayer: BoxChildLayer = {
+                                  id: `lyr_${Date.now()}_${idxNum}`,
+                                  name: `${item.label} ${idxNum}`,
+                                  kind: item.kind,
+                                  text:
+                                    item.kind === 'divider'
+                                      ? ''
+                                      : item.kind === 'button'
+                                        ? `دکمه ${idxNum}`
+                                        : item.kind === 'badge'
+                                          ? `نشان: {score}`
+                                          : item.kind === 'image'
+                                            ? 'تصویر'
+                                            : `متن لایه ${idxNum}`,
+                                  color: item.kind === 'button' ? '#0B0E14' : '#F8FAFC',
+                                  bgColor:
+                                    item.kind === 'button'
+                                      ? '#F59E0B'
+                                      : item.kind === 'badge'
+                                        ? '#0284C7'
+                                        : item.kind === 'card'
+                                          ? 'rgba(30, 41, 59, 0.85)'
+                                          : 'rgba(15, 23, 42, 0.45)',
+                                  borderColor: item.kind === 'button' ? '#FCD34D' : '#334155',
+                                  clickable: item.kind === 'button',
+                                  visible: true,
+                                };
+                                updateEntity(selectedEntity.id, {
+                                  height:
+                                    selectedEntity.height < 120 ? 150 : selectedEntity.height,
+                                  textConfig: {
+                                    ...selectedEntity.textConfig!,
+                                    children: [...cur, newLayer],
+                                  },
+                                });
+                              }}
+                              className="px-2 py-1 rounded bg-[#0B0E14] border border-slate-700 text-[10px] text-slate-200 hover:border-sky-400 cursor-pointer"
+                            >
+                              + {item.label}
+                            </button>
+                          ))}
+                        </div>
+
+                        <div className="space-y-2 max-h-80 overflow-y-auto pl-1">
+                          {(selectedEntity.textConfig.children || []).map((layer, lIdx, arr) => {
+                            const patchLayer = (patch: Partial<BoxChildLayer>) => {
+                              const nextChildren = arr.map((item) =>
+                                item.id === layer.id ? { ...item, ...patch } : item
+                              );
+                              updateEntity(selectedEntity.id, {
+                                textConfig: {
+                                  ...selectedEntity.textConfig!,
+                                  children: nextChildren,
+                                },
+                              });
+                            };
+                            const moveLayer = (dir: -1 | 1) => {
+                              const targetIdx = lIdx + dir;
+                              if (targetIdx < 0 || targetIdx >= arr.length) return;
+                              const nextChildren = [...arr];
+                              const [moved] = nextChildren.splice(lIdx, 1);
+                              nextChildren.splice(targetIdx, 0, moved);
+                              updateEntity(selectedEntity.id, {
+                                textConfig: {
+                                  ...selectedEntity.textConfig!,
+                                  children: nextChildren,
+                                },
+                              });
+                            };
+                            const imageAssets = project.assets.filter((a) => a.kind === 'image');
+
+                            return (
+                              <div
+                                key={layer.id}
+                                className="rounded-lg border border-slate-800 bg-[#0B0E14] p-2 space-y-2"
+                              >
+                                <div className="flex items-center justify-between gap-1">
+                                  <input
+                                    type="text"
+                                    value={layer.name}
+                                    onChange={(e) => patchLayer({ name: e.target.value })}
+                                    className="px-1.5 py-0.5 rounded border border-slate-700 bg-[#131822] text-[11px] text-slate-100 w-28"
+                                  />
+                                  <div className="flex items-center gap-0.5">
+                                    <button
+                                      type="button"
+                                      title="بالا"
+                                      onClick={() => moveLayer(-1)}
+                                      className="p-1 text-slate-400 hover:text-slate-100"
+                                    >
+                                      <ArrowUp className="w-3 h-3" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      title="پایین"
+                                      onClick={() => moveLayer(1)}
+                                      className="p-1 text-slate-400 hover:text-slate-100"
+                                    >
+                                      <ArrowDown className="w-3 h-3" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      title="کپی لایه"
+                                      onClick={() => {
+                                        const dup: BoxChildLayer = {
+                                          ...layer,
+                                          id: `lyr_${Date.now()}_d`,
+                                          name: `${layer.name} کپی`,
+                                        };
+                                        const nextChildren = [...arr];
+                                        nextChildren.splice(lIdx + 1, 0, dup);
+                                        updateEntity(selectedEntity.id, {
+                                          textConfig: {
+                                            ...selectedEntity.textConfig!,
+                                            children: nextChildren,
+                                          },
+                                        });
+                                      }}
+                                      className="p-1 text-slate-400 hover:text-sky-300"
+                                    >
+                                      <Copy className="w-3 h-3" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      title="نمایش/مخفی"
+                                      onClick={() => patchLayer({ visible: !layer.visible })}
+                                      className="p-1 text-slate-400 hover:text-slate-100"
+                                    >
+                                      {layer.visible ? (
+                                        <Eye className="w-3 h-3" />
+                                      ) : (
+                                        <EyeOff className="w-3 h-3" />
+                                      )}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      title="حذف"
+                                      onClick={() => {
+                                        updateEntity(selectedEntity.id, {
+                                          textConfig: {
+                                            ...selectedEntity.textConfig!,
+                                            children: arr.filter((x) => x.id !== layer.id),
+                                          },
+                                        });
+                                      }}
+                                      className="p-1 text-slate-500 hover:text-red-400"
+                                    >
+                                      <Trash2 className="w-3 h-3" />
+                                    </button>
+                                  </div>
+                                </div>
+
+                                {layer.kind !== 'divider' && (
+                                  <textarea
+                                    rows={2}
+                                    value={layer.text}
+                                    onChange={(e) => patchLayer({ text: e.target.value })}
+                                    placeholder="متن لایه..."
+                                    className="w-full px-2 py-1 rounded border border-slate-700 bg-[#131822] text-[11px] text-slate-100"
+                                  />
+                                )}
+
+                                {layer.kind === 'image' && (
+                                  <select
+                                    value={layer.assetId || ''}
+                                    onChange={(e) =>
+                                      patchLayer({ assetId: e.target.value || undefined })
+                                    }
+                                    className="w-full px-2 py-1 rounded border border-slate-700 bg-[#131822] text-[11px] text-slate-100"
+                                  >
+                                    <option value="">-- انتخاب تصویر از فایل‌ها --</option>
+                                    {imageAssets.map((a) => (
+                                      <option key={a.id} value={a.id}>
+                                        {a.name}
+                                      </option>
+                                    ))}
+                                  </select>
+                                )}
+
+                                {layer.kind !== 'divider' && (
+                                  <div className="grid grid-cols-2 gap-1.5">
+                                    <ColorPickerField
+                                      label="رنگ متن"
+                                      value={layer.color || '#F8FAFC'}
+                                      onChange={(c) => patchLayer({ color: c })}
+                                    />
+                                    <ColorPickerField
+                                      label="رنگ پس‌زمینه"
+                                      allowAlpha
+                                      value={layer.bgColor || 'transparent'}
+                                      onChange={(c) => patchLayer({ bgColor: c })}
+                                    />
+                                  </div>
+                                )}
+
+                                <div className="grid grid-cols-3 gap-1.5 items-center text-[10px]">
+                                  <div>
+                                    <span className="text-slate-500 block">عرض</span>
+                                    <NumericInput
+                                      min={0}
+                                      max={800}
+                                      value={layer.width ?? 0}
+                                      onChange={(v) =>
+                                        patchLayer({ width: v > 0 ? v : undefined })
+                                      }
+                                      className="w-full px-1 py-0.5 rounded border border-slate-700 bg-[#131822] text-slate-100 text-center font-mono"
+                                    />
+                                  </div>
+                                  <div>
+                                    <span className="text-slate-500 block">ارتفاع</span>
+                                    <NumericInput
+                                      min={0}
+                                      max={500}
+                                      value={layer.height ?? 0}
+                                      onChange={(v) =>
+                                        patchLayer({ height: v > 0 ? v : undefined })
+                                      }
+                                      className="w-full px-1 py-0.5 rounded border border-slate-700 bg-[#131822] text-slate-100 text-center font-mono"
+                                    />
+                                  </div>
+                                  <div>
+                                    <span className="text-slate-500 block">فونت</span>
+                                    <NumericInput
+                                      min={9}
+                                      max={36}
+                                      value={layer.fontSize ?? selectedEntity.textConfig!.fontSize}
+                                      onChange={(v) => patchLayer({ fontSize: v })}
+                                      className="w-full px-1 py-0.5 rounded border border-slate-700 bg-[#131822] text-slate-100 text-center font-mono"
+                                    />
+                                  </div>
+                                </div>
+
+                                {layer.kind !== 'divider' && (
+                                  <div className="space-y-1 pt-0.5">
+                                    <label className="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer">
+                                      <input
+                                        type="checkbox"
+                                        checked={Boolean(layer.clickable || layer.kind === 'button')}
+                                        onChange={(e) => patchLayer({ clickable: e.target.checked })}
+                                      />
+                                      <span>کلیک‌پذیر بودن همین لایه</span>
+                                    </label>
+                                    {(layer.clickable || layer.kind === 'button') && (
+                                      <div className="flex flex-wrap gap-1">
+                                        {[
+                                          {
+                                            label: '+۱۰ امتیاز',
+                                            rule: `کلیک روی ${layer.name}: امتیاز +10 | افکت جرقه | صدا coin`,
+                                          },
+                                          {
+                                            label: 'پیام',
+                                            rule: `کلیک روی ${layer.name}: نمایش پیام "روی ${layer.name} کلیک شد!" | صدا click`,
+                                          },
+                                          {
+                                            label: 'پرش',
+                                            rule: `کلیک روی ${layer.name}: ${
+                                              project.entities.find((e) => e.role === 'player')?.name ||
+                                              'بازیکن'
+                                            } پرش قدرت ${project.engineMode === '3d' ? 10 : 540} | صدا jump`,
+                                          },
+                                        ].map((pr) => (
+                                          <button
+                                            key={pr.label}
+                                            type="button"
+                                            onClick={() =>
+                                              onUpdateProject((prev) => {
+                                                const nextText = prev.rulesText.trim()
+                                                  ? `${prev.rulesText.trim()}\n${pr.rule}`
+                                                  : pr.rule;
+                                                return {
+                                                  ...prev,
+                                                  rulesText: nextText,
+                                                  rules: parsePersianRules(nextText, prev.entities).rules,
+                                                  updatedAt: Date.now(),
+                                                };
+                                              })
+                                            }
+                                            className="px-1.5 py-0.5 rounded bg-[#131822] border border-slate-700 text-[10px] text-amber-300 hover:border-amber-400"
+                                          >
+                                            + {pr.label}
+                                          </button>
+                                        ))}
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
                     </div>
                   )}
 

@@ -82,9 +82,19 @@ function extractNumber(text: string, keywordRegex: RegExp, fallback: number): nu
 }
 
 function findMatchingEntityName(clause: string, entities: GameEntity[], fallback: string): string {
+  const candidates: string[] = [];
   for (const entity of entities) {
-    if (entity.name && clause.includes(entity.name)) {
-      return entity.name;
+    if (entity.name) candidates.push(entity.name);
+    if (entity.textConfig?.children) {
+      for (const child of entity.textConfig.children) {
+        if (child.name) candidates.push(child.name);
+      }
+    }
+  }
+  candidates.sort((a, b) => b.length - a.length);
+  for (const name of candidates) {
+    if (clause.includes(name)) {
+      return name;
     }
   }
   return fallback;
@@ -169,6 +179,15 @@ function parseSingleAction(
   if (clean.includes('بازگشت') || clean.includes('شروع مجدد')) {
     return { actionType: 'respawn', targetName };
   }
+  if (clean.includes('تغییر متن')) {
+    const quoted = clean.match(/["«']([^"»']+)["»']/);
+    return { actionType: 'set-text', targetName, paramText: quoted ? quoted[1] : 'متن جدید' };
+  }
+  if (clean.includes('اسکرول')) {
+    const amount = extractNumber(clean, /(?:مقدار|اندازه)\s+(-?\d+)/, 60);
+    const axis = clean.includes('افقی') ? 'x' : 'y';
+    return { actionType: 'scroll-box', targetName, paramNumber: amount, paramText: axis };
+  }
   if (clean.includes('امتیاز')) {
     const match = clean.match(/([+-]?\d+)/);
     const amount = match ? Number(match[1]) : 10;
@@ -188,14 +207,6 @@ function parseSingleAction(
     const quoted = clean.match(/["«']([^"»']+)["»']/);
     const msg = quoted ? quoted[1] : clean.replace(/نمایش|پیام/g, '').trim() || 'مرحله کامل شد!';
     return { actionType: 'show-message', targetName, paramText: msg };
-  }
-  if (clean.includes('تغییر متن')) {
-    const quoted = clean.match(/["«']([^"»']+)["»']/);
-    return { actionType: 'set-text', targetName, paramText: quoted ? quoted[1] : 'متن جدید' };
-  }
-  if (clean.includes('اسکرول')) {
-    const amount = extractNumber(clean, /(?:مقدار|اندازه)\s+(-?\d+)/, 60);
-    return { actionType: 'scroll-box', targetName, paramNumber: amount };
   }
   if (clean.includes('پرتاب خود') || clean.includes('پرتاب شود')) {
     const power = extractNumber(clean, /(?:قدرت|سرعت)\s+(\d+)/, 480);
@@ -268,21 +279,40 @@ export function parsePersianRules(
       return;
     }
 
-    const sepIdx = trimmed.includes(':') ? trimmed.indexOf(':') : trimmed.indexOf('->');
+    let lineToParse = trimmed;
+    if (lineToParse.startsWith('اگر ')) {
+      lineToParse = lineToParse.slice(4).trim();
+    }
+
+    let sepIdx = -1;
+    let sepLen = 1;
+    if (lineToParse.includes(':')) {
+      sepIdx = lineToParse.indexOf(':');
+      sepLen = 1;
+    } else if (lineToParse.includes('->')) {
+      sepIdx = lineToParse.indexOf('->');
+      sepLen = 2;
+    } else if (lineToParse.includes('آنگاه')) {
+      sepIdx = lineToParse.indexOf('آنگاه');
+      sepLen = 5;
+    } else if (lineToParse.includes('سپس')) {
+      sepIdx = lineToParse.indexOf('سپس');
+      sepLen = 4;
+    }
+
     if (sepIdx === -1) {
       diagnostics.push({
         lineNumber: idx + 1,
         rawLine: trimmed,
         valid: false,
-        message: 'از علامت «:» بین شرط و دستور استفاده کنید (مثال: کلید راست: بازیکن حرکت راست سرعت 250)',
+        message: 'از علامت «:» یا واژه «آنگاه» بین شرط و دستور استفاده کنید (مثال: کلید راست: بازیکن حرکت راست سرعت 250)',
         rules: [],
       });
       return;
     }
 
-    const sepLen = trimmed.includes(':') ? 1 : 2;
-    const triggerClause = normalizeDigits(trimmed.slice(0, sepIdx)).trim();
-    const actionClause = normalizeDigits(trimmed.slice(sepIdx + sepLen)).trim();
+    const triggerClause = normalizeDigits(lineToParse.slice(0, sepIdx)).trim();
+    const actionClause = normalizeDigits(lineToParse.slice(sepIdx + sepLen)).trim();
 
     let triggerType: GameRule['triggerType'] = 'always';
     let key: string | undefined;
@@ -581,7 +611,10 @@ export function ruleToPersianLine(rule: GameRule): string {
       actionPart = `تغییر متن ${rule.targetName} "${rule.paramText || 'متن جدید'}"`;
       break;
     case 'scroll-box':
-      actionPart = `اسکرول ${rule.targetName} مقدار ${rule.paramNumber ?? 60}`;
+      actionPart =
+        rule.paramText === 'x'
+          ? `اسکرول افقی ${rule.targetName} مقدار ${rule.paramNumber ?? 60}`
+          : `اسکرول ${rule.targetName} مقدار ${rule.paramNumber ?? 60}`;
       break;
   }
 
@@ -698,3 +731,175 @@ export function syncProjectRules(project: RayanProject, newRulesText: string): R
     updatedAt: Date.now(),
   };
 }
+
+/**
+ * Parses a single rule line into a structured GameRule for testing or quick lookup.
+ */
+export function parseRuleText(
+  ruleLine: string,
+  entities: GameEntity[] = []
+): GameRule | null {
+  const fallbackEntities: GameEntity[] = entities.length > 0 ? entities : [
+    {
+      id: 'mock_player',
+      name: 'بازیکن',
+      role: 'player',
+      kind: 'shape2d',
+      shape2d: 'rect',
+      x: 0,
+      y: 0,
+      z: 0,
+      width: 32,
+      height: 32,
+      depth: 32,
+      rotationX: 0,
+      rotationY: 0,
+      rotationZ: 0,
+      color: '#ff0000',
+      opacity: 1,
+      visible: true,
+      physics: {
+        enabled: true,
+        isStatic: false,
+        useGravity: true,
+        mass: 1,
+        bounce: 0,
+        friction: 0.5,
+        collider: 'box',
+      },
+      animation: {
+        preset: 'none',
+        speed: 1,
+        amplitude: 10,
+        spriteCols: 1,
+        spriteRows: 1,
+        fps: 8,
+      },
+    },
+    {
+      id: 'mock_coin',
+      name: 'سکه',
+      role: 'collectible',
+      kind: 'shape2d',
+      shape2d: 'circle',
+      x: 50,
+      y: 0,
+      z: 0,
+      width: 24,
+      height: 24,
+      depth: 24,
+      rotationX: 0,
+      rotationY: 0,
+      rotationZ: 0,
+      color: '#fbbf24',
+      opacity: 1,
+      visible: true,
+      physics: {
+        enabled: true,
+        isStatic: true,
+        useGravity: false,
+        mass: 0,
+        bounce: 0,
+        friction: 0.5,
+        collider: 'sphere',
+      },
+      animation: {
+        preset: 'none',
+        speed: 1,
+        amplitude: 10,
+        spriteCols: 1,
+        spriteRows: 1,
+        fps: 8,
+      },
+    },
+    {
+      id: 'mock_hazard',
+      name: 'مانع',
+      role: 'enemy',
+      kind: 'shape2d',
+      shape2d: 'rect',
+      x: 100,
+      y: 0,
+      z: 0,
+      width: 32,
+      height: 32,
+      depth: 32,
+      rotationX: 0,
+      rotationY: 0,
+      rotationZ: 0,
+      color: '#ef4444',
+      opacity: 1,
+      visible: true,
+      physics: {
+        enabled: true,
+        isStatic: true,
+        useGravity: false,
+        mass: 1,
+        bounce: 0,
+        friction: 0.5,
+        collider: 'box',
+      },
+      animation: {
+        preset: 'none',
+        speed: 1,
+        amplitude: 10,
+        spriteCols: 1,
+        spriteRows: 1,
+        fps: 8,
+      },
+    },
+    {
+      id: 'mock_box',
+      name: 'کادر لیست',
+      role: 'text-box',
+      kind: 'text-box',
+      x: 100,
+      y: 100,
+      z: 0,
+      width: 200,
+      height: 200,
+      depth: 10,
+      rotationX: 0,
+      rotationY: 0,
+      rotationZ: 0,
+      color: '#334155',
+      opacity: 1,
+      visible: true,
+      textConfig: {
+        text: 'متن کادر',
+        fontSize: 14,
+        textColor: '#ffffff',
+        boxBgColor: '#1e293b',
+        boxBorderColor: '#475569',
+        boxBorderWidth: 1,
+        boxBorderRadius: 8,
+        boxPadding: 8,
+        scrollable: true,
+        fixedOnScreen: false,
+        clickable: false,
+        align: 'right',
+      },
+      physics: {
+        enabled: false,
+        isStatic: true,
+        useGravity: false,
+        mass: 0,
+        bounce: 0,
+        friction: 0,
+        collider: 'none',
+      },
+      animation: {
+        preset: 'none',
+        speed: 1,
+        amplitude: 10,
+        spriteCols: 1,
+        spriteRows: 1,
+        fps: 8,
+      },
+    },
+  ];
+
+  const { rules } = parsePersianRules(ruleLine, fallbackEntities);
+  return rules[0] || null;
+}
+

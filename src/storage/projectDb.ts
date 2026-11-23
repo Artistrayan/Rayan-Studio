@@ -1,5 +1,64 @@
-import type { GameScene, RayanProject, TileType } from '../types/studio';
+import type { CodeFileItem, GameScene, RayanProject, TileType } from '../types/studio';
 import { parsePersianRules } from '../engine/ruleParser';
+
+export function createDefaultCodeFiles(projectName = 'بازی رایان'): CodeFileItem[] {
+  const now = Date.now();
+  return [
+    {
+      id: 'code_game_hooks',
+      name: 'gameHooks.js',
+      path: 'scripts/gameHooks.js',
+      language: 'javascript',
+      enabledInRuntime: true,
+      updatedAt: now,
+      content: `// اسکریپت اختصاصی بازی — مستقیماً در موتور بازی و خروجی اجرا می‌شود
+// ابزارهای در دسترس روی شیء api:
+// api.score, api.addScore(n), api.health, api.setHealth(n)
+// api.vars, api.setVar(name, val), api.findEntity(name), api.moveEntity(name, vx, vy)
+// api.showMessage(text), api.playSound(name), api.log(text), api.elapsed
+
+function onStart(api) {
+  api.log('اسکریپت gameHooks.js برای ${projectName.replace(/'/g, '')} فعال شد');
+}
+
+function onUpdate(api, dt) {
+  // مثال: هر ۳۰ ثانیه ۱ امتیاز بقا اضافه شود (می‌توانید کد دلخواه خود را بنویسید)
+}
+`,
+    },
+    {
+      id: 'code_custom_hud',
+      name: 'customHud.css',
+      path: 'styles/customHud.css',
+      language: 'css',
+      enabledInRuntime: true,
+      updatedAt: now,
+      content: `/* استایل‌های سفارشی برای کادرهای متن و دکمه‌های HUD بازی */
+.rayan-hud-glow {
+  box-shadow: 0 0 18px rgba(245, 158, 11, 0.25);
+}
+`,
+    },
+    {
+      id: 'code_game_config',
+      name: 'gameConfig.json',
+      path: 'config/gameConfig.json',
+      language: 'json',
+      enabledInRuntime: false,
+      updatedAt: now,
+      content: JSON.stringify(
+        {
+          studio: 'Rayan Game Studio',
+          version: '1.0.0',
+          difficulty: 'normal',
+          enableCustomScripts: true,
+        },
+        null,
+        2
+      ),
+    },
+  ];
+}
 
 const DB_NAME = 'rayan_game_studio_db';
 const DB_VERSION = 1;
@@ -58,6 +117,7 @@ export function normalizeProject(raw: RayanProject): RayanProject {
   return {
     ...raw,
     assets: raw.assets || [],
+    codeFiles: Array.isArray(raw.codeFiles) ? raw.codeFiles : createDefaultCodeFiles(raw.name),
     scenes,
     activeSceneId,
     environment: activeScene.environment,

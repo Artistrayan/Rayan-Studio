@@ -68,7 +68,7 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({
             <input
               ref={fileInputRef}
               type="file"
-              accept=".json,.rayan.json"
+              accept=".json,.rayan.json,.zip"
               className="hidden"
               onChange={(e) => {
                 const file = e.target.files?.[0];
@@ -82,7 +82,7 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({
               className="flex items-center gap-2 px-4 py-2 rounded-lg border border-slate-700 bg-slate-800/70 text-xs font-medium text-slate-200 hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
             >
               <Upload className="w-4 h-4" />
-              بارگذاری فایل پروژه
+              ورودی فایل پروژه / زیپ (ZIP)
             </button>
           </div>
         </div>

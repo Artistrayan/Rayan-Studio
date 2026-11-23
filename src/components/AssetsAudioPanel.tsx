@@ -10,6 +10,7 @@ import {
 } from 'lucide-react';
 import type { AssetFormat, AssetKind, RayanAsset, RayanProject } from '../types/studio';
 import { audioEngine } from '../engine/audioEngine';
+import { importZipPackage } from '../engine/zipHandler';
 
 interface AssetsAudioPanelProps {
   project: RayanProject;
@@ -77,10 +78,23 @@ export const AssetsAudioPanel: React.FC<AssetsAudioPanelProps> = ({
     setUploadError(null);
 
     for (const file of Array.from(files)) {
+      if (file.name.toLowerCase().endsWith('.zip')) {
+        try {
+          const res = await importZipPackage(file);
+          res.assets.forEach((a) => onAddAsset(a));
+          if (res.assets.length === 0) {
+            setUploadError(`درون فایل زیپ «${file.name}» تصویر، مدل سه‌بعدی یا فایل صوتی یافت نشد (برای فایل‌های کد از محیط کدنویسی استفاده کنید).`);
+          }
+        } catch {
+          setUploadError(`خطا در خواندن فایل زیپ «${file.name}».`);
+        }
+        continue;
+      }
+
       const detected = detectKindAndFormat(file.name);
       if (!detected) {
         setUploadError(
-          `فرمت فایل «${file.name}» پشتیبانی نمی‌شود. فرمت‌های مجاز: PNG, JPG, SVG, GLB, GLTF, OBJ, STL, FBX, PLY, MP3, WAV, OGG`
+          `فرمت فایل «${file.name}» پشتیبانی نمی‌شود. فرمت‌های مجاز: PNG, JPG, SVG, GLB, GLTF, OBJ, STL, FBX, PLY, MP3, WAV, OGG, ZIP`
         );
         continue;
       }
@@ -139,7 +153,7 @@ export const AssetsAudioPanel: React.FC<AssetsAudioPanelProps> = ({
               ref={fileInputRef}
               type="file"
               multiple
-              accept=".png,.jpg,.jpeg,.webp,.svg,.glb,.gltf,.obj,.stl,.fbx,.ply,.mp3,.wav,.ogg,.m4a"
+              accept=".png,.jpg,.jpeg,.webp,.svg,.glb,.gltf,.obj,.stl,.fbx,.ply,.mp3,.wav,.ogg,.m4a,.zip"
               className="hidden"
               onChange={(e) => {
                 void handleFiles(e.target.files);

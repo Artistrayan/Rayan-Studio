@@ -72,6 +72,24 @@ export type Model3DPresetType =
   | 'turret'
   | 'platform-block';
 
+export type BoxLayerKind = 'text' | 'image' | 'badge' | 'button' | 'divider' | 'card';
+
+export interface BoxChildLayer {
+  id: string;
+  name: string;
+  kind: BoxLayerKind;
+  text: string;
+  assetId?: string;
+  color: string;
+  bgColor: string;
+  borderColor?: string;
+  fontSize?: number;
+  width?: number;
+  height?: number;
+  clickable?: boolean;
+  visible: boolean;
+}
+
 export interface TextConfig {
   text: string;
   fontSize: number;
@@ -82,9 +100,13 @@ export interface TextConfig {
   boxBorderRadius: number;
   boxPadding: number;
   scrollable: boolean;
+  scrollableX?: boolean;
   fixedOnScreen: boolean;
   clickable: boolean;
   align: 'right' | 'center' | 'left';
+  layoutDirection?: 'vertical' | 'horizontal';
+  childGap?: number;
+  children?: BoxChildLayer[];
 }
 
 export interface PhysicsConfig {
@@ -253,6 +275,26 @@ export interface SoundBindings {
   onClick: string;
 }
 
+export type CodeFileLanguage =
+  | 'javascript'
+  | 'typescript'
+  | 'python'
+  | 'lua'
+  | 'css'
+  | 'html'
+  | 'json'
+  | 'text';
+
+export interface CodeFileItem {
+  id: string;
+  name: string;
+  path: string;
+  language: CodeFileLanguage;
+  content: string;
+  enabledInRuntime?: boolean;
+  updatedAt: number;
+}
+
 export interface RayanProject {
   id: string;
   name: string;
@@ -260,6 +302,8 @@ export interface RayanProject {
   engineMode: EngineMode;
   screenConfig: ScreenConfig;
   assets: RayanAsset[];
+  /** Custom code files (.js, .ts, .css, .html, .json, etc.) */
+  codeFiles?: CodeFileItem[];
   /** Mirrors the active scene for convenience & backward compatibility */
   environment: EnvironmentConfig;
   entities: GameEntity[];

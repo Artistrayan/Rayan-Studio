@@ -15,6 +15,7 @@ import {
   exportWebSingleHtml,
   exportWindowsProjectZip,
 } from '../engine/exporters';
+import { exportCodeFilesZip, exportCompleteProjectZip } from '../engine/zipHandler';
 
 interface ExportViewProps {
   project: RayanProject;
@@ -136,25 +137,43 @@ export const ExportView: React.FC<ExportViewProps> = ({ project }) => {
           </div>
         </div>
 
-        {/* Project Source Backup */}
+        {/* Project Source Backup & Complete ZIP */}
         <div className="rounded-xl border border-slate-800 bg-[#131822] p-6 flex flex-col justify-between gap-5">
           <div className="space-y-2.5">
             <div className="flex items-center gap-2.5 text-slate-300">
               <FileCode2 className="w-5 h-5" />
-              <h3 className="text-base font-bold text-slate-100">ذخیره فایل منبع پروژه رایان</h3>
+              <h3 className="text-base font-bold text-slate-100">خروجی ZIP کامل پروژه، کدها و فایل منبع</h3>
             </div>
             <p className="text-xs text-slate-400 leading-relaxed">
-              خروجی گرفتن از فایل کامل پروژه (.rayan.json) برای پشتیبان‌گیری یا انتقال و ویرایش در سیستم‌های دیگر به صورت آفلاین.
+              خروجی گرفتن از کل پروژه به صورت فایل ZIP (شامل کدهای JS/CSS/JSON، تصاویر، مدل‌ها، صداها و نسخه اجرایی HTML) یا دانلود فایل تکی .rayan.json.
             </p>
           </div>
-          <button
-            type="button"
-            onClick={() => runExport('source', 'منبع پروژه', () => exportRayanProjectFile(project))}
-            className="flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg border border-slate-700 bg-slate-800 text-slate-100 text-xs font-bold hover:bg-slate-700 transition-colors"
-          >
-            <Download className="w-4 h-4" />
-            دانلود فایل پروژه (.rayan.json)
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              disabled={busyKey !== null}
+              onClick={() => runExport('complete-zip', 'بسته کامل ZIP', () => exportCompleteProjectZip(project))}
+              className="flex-1 flex items-center justify-center gap-2 py-2.5 px-3 rounded-lg bg-indigo-500 text-white text-xs font-bold hover:bg-indigo-400 transition-colors whitespace-nowrap"
+            >
+              <FileArchive className="w-4 h-4" />
+              {busyKey === 'complete-zip' ? 'در حال بسته‌بندی...' : 'خروجی زیپ کامل (ZIP)'}
+            </button>
+            <button
+              type="button"
+              disabled={busyKey !== null}
+              onClick={() => runExport('code-zip', 'کدهای پروژه ZIP', () => exportCodeFilesZip(project))}
+              className="py-2.5 px-3 rounded-lg border border-slate-700 bg-slate-800 text-slate-200 text-xs font-semibold hover:bg-slate-700 transition-colors whitespace-nowrap"
+            >
+              زیپ کدها
+            </button>
+            <button
+              type="button"
+              onClick={() => runExport('source', 'منبع پروژه', () => exportRayanProjectFile(project))}
+              className="py-2.5 px-3 rounded-lg border border-slate-700 bg-slate-800 text-slate-100 text-xs font-semibold hover:bg-slate-700 transition-colors whitespace-nowrap"
+            >
+              .rayan.json
+            </button>
+          </div>
         </div>
       </div>
     </div>

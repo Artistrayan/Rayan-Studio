@@ -4,6 +4,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import type {
+  BoxChildLayer,
   GameEntity,
   GameRule,
   GameScene,
@@ -13,6 +14,12 @@ import type {
 import { audioEngine } from './audioEngine';
 import { buildProceduralPresetGroup, loadCustom3DAsset } from './threeModels';
 import type { RuntimeStatsPayload } from './Engine2D';
+import { BoxLayersRenderer } from '../components/BoxLayersRenderer';
+import {
+  compileRuntimeScripts,
+  type CompiledScriptHandle,
+  type ScriptRuntimeApi,
+} from './customScriptRunner';
 
 interface Engine3DProps {
   project: RayanProject;
@@ -144,6 +151,8 @@ export const Engine3D: React.FC<Engine3DProps> = ({
   const [clickedBoxId, setClickedBoxId] = useState<string | null>(null);
   const lastScrollRuleRef = useRef<Map<string, number>>(new Map());
   const suppressNextClickRef = useRef(false);
+  const compiledScriptsRef = useRef<CompiledScriptHandle[]>([]);
+  const scriptsStartedRef = useRef(false);
   const [debugBadge, setDebugBadge] = useState({
     fps: 60,
     entities: project.entities.length,
@@ -441,8 +450,14 @@ export const Engine3D: React.FC<Engine3DProps> = ({
 
     if (isPlaying) {
       audioEngine.startBgm(project.soundBindings.bgm, project.assets);
+      compiledScriptsRef.current = compileRuntimeScripts(project.codeFiles, (fname, errMsg) => {
+        logsRef.current = [`خطای کد ${fname}: ${errMsg}`, ...logsRef.current.slice(0, 14)];
+      });
+      scriptsStartedRef.current = false;
     } else {
       audioEngine.stopBgm();
+      compiledScriptsRef.current = [];
+      scriptsStartedRef.current = false;
     }
 
     return () => {
@@ -455,6 +470,7 @@ export const Engine3D: React.FC<Engine3DProps> = ({
     project.environment,
     project.camera,
     project.editorSettings,
+    project.codeFiles,
     isPlaying,
     project.variables.score,
     project.variables.health,
@@ -943,7 +959,13 @@ export const Engine3D: React.FC<Engine3DProps> = ({
           const box = projectRef.current.entities.find((e) => e.name === rule.targetName);
           if (box) {
             const el = document.getElementById(`rayan-overlay-${box.id}`);
-            if (el) el.scrollTop += rule.paramNumber ?? 60;
+            if (el) {
+              if (rule.paramText === 'x') {
+                el.scrollLeft += rule.paramNumber ?? 60;
+              } else {
+                el.scrollTop += rule.paramNumber ?? 60;
+              }
+            }
           }
           break;
         }
@@ -1009,6 +1031,86 @@ export const Engine3D: React.FC<Engine3DProps> = ({
         elapsedRef.current += dt;
         const curScene = runtimeSceneRef.current;
         const sims = Array.from(simMapRef.current.values());
+
+        if (compiledScriptsRef.current.length > 0) {
+          const scriptApi: ScriptRuntimeApi = {
+            get score() {
+              return varsRef.current.score;
+            },
+            setScore: (val) => {
+              varsRef.current.score = val;
+            },
+            addScore: (delta) => {
+              varsRef.current.score += delta;
+            },
+            get health() {
+              return varsRef.current.health;
+            },
+            setHealth: (val) => {
+              varsRef.current.health = Math.max(0, val);
+            },
+            get vars() {
+              return varsRef.current.custom;
+            },
+            setVar: (name, val) => {
+              varsRef.current.custom[name] = val;
+            },
+            get elapsed() {
+              return elapsedRef.current;
+            },
+            findEntity: (name) => {
+              const found = sims.find((s) => s.alive && s.entity.name === name);
+              if (!found) return null;
+              return {
+                name: found.entity.name,
+                x: found.object3D.position.x,
+                y: found.object3D.position.y,
+                z: found.object3D.position.z,
+                vx: found.vx,
+                vy: found.vy,
+                visible: found.object3D.visible,
+              };
+            },
+            moveEntity: (name, vx, vy, vz = 0) => {
+              const found = sims.find((s) => s.alive && s.entity.name === name);
+              if (found) {
+                found.vx = vx;
+                found.vy = vy;
+                found.vz = vz;
+              }
+            },
+            setEntityPosition: (name, x, y, z = 0) => {
+              const found = sims.find((s) => s.alive && s.entity.name === name);
+              if (found) {
+                found.object3D.position.set(x, y, z);
+              }
+            },
+            showMessage: (msg) => setBannerMessage(String(msg)),
+            playSound: (name) => audioEngine.playSound(name, projectRef.current.assets),
+            spawnParticles: () => {},
+            log: (msg) => {
+              logsRef.current = [String(msg), ...logsRef.current.slice(0, 14)];
+            },
+          };
+
+          if (!scriptsStartedRef.current) {
+            scriptsStartedRef.current = true;
+            for (const h of compiledScriptsRef.current) {
+              try {
+                h.onStart?.(scriptApi);
+              } catch {
+                // ignore
+              }
+            }
+          }
+          for (const h of compiledScriptsRef.current) {
+            try {
+              h.onUpdate?.(scriptApi, dt);
+            } catch {
+              // ignore
+            }
+          }
+        }
 
         sims.forEach((s) => {
           if (!s.alive || s.entity.physics.isStatic) return;
@@ -1266,11 +1368,26 @@ export const Engine3D: React.FC<Engine3DProps> = ({
     setVirtualKeys((prev) => ({ ...prev, [code]: pressed }));
   };
 
+  const triggerLayerClick = (layer: BoxChildLayer) => {
+    audioEngine.playSound(project.soundBindings.onClick || 'click', project.assets);
+    const matchedRules = runtimeSceneRef.current.rules.filter(
+      (rule) => rule.enabled && rule.triggerType === 'on-click' && rule.targetName === layer.name
+    );
+    matchedRules.forEach((rule) => run3DRuleRef.current?.(rule, 0.016, false));
+    if (matchedRules.length === 0) {
+      logsRef.current = [`کلیک روی لایه «${layer.name}»`, ...logsRef.current.slice(0, 14)];
+    }
+  };
+
   return (
     <div
       className="relative w-full h-full overflow-hidden rounded-lg border border-slate-700/80 bg-[#0B0E14]"
       style={{ aspectRatio: `${project.screenConfig.width} / ${project.screenConfig.height}` }}
     >
+      {isPlaying &&
+        (project.codeFiles || [])
+          .filter((cf) => cf.enabledInRuntime && cf.language === 'css')
+          .map((cf) => <style key={cf.id}>{cf.content}</style>)}
       <div ref={mountRef} className="w-full h-full" />
 
       {contextLost && (
@@ -1294,25 +1411,37 @@ export const Engine3D: React.FC<Engine3DProps> = ({
           );
           const isClickable = Boolean(cfg.clickable || b.clickable || hasClickRule);
 
+          const hasScrollX = Boolean(cfg.scrollableX);
+          const hasScrollY = Boolean(cfg.scrollable);
+          const hasAnyScroll = hasScrollX || hasScrollY;
+
           return (
             <div
               key={b.id}
               id={`rayan-overlay-${b.id}`}
               onWheel={(e) => {
-                if (cfg.scrollable) e.stopPropagation();
+                if (!hasAnyScroll) return;
+                e.stopPropagation();
+                if (((hasScrollX && !hasScrollY) || (hasScrollX && e.shiftKey)) && e.deltaY !== 0 && e.deltaX === 0) {
+                  e.currentTarget.scrollLeft += e.deltaY;
+                }
               }}
               onPointerDown={(e) => {
                 if (isPlaying) {
-                  if (cfg.scrollable) {
+                  if (hasAnyScroll) {
                     const targetEl = e.currentTarget;
+                    const startX = e.clientX;
                     const startY = e.clientY;
-                    const startScroll = targetEl.scrollTop;
+                    const startScrollLeft = targetEl.scrollLeft;
+                    const startScrollTop = targetEl.scrollTop;
                     let dragged = false;
                     const onPlayMove = (ev: PointerEvent) => {
+                      const dx = ev.clientX - startX;
                       const dy = ev.clientY - startY;
-                      if (Math.abs(dy) > 5) {
+                      if (Math.hypot(dx, dy) > 5) {
                         dragged = true;
-                        targetEl.scrollTop = startScroll - dy;
+                        if (hasScrollX) targetEl.scrollLeft = startScrollLeft - dx;
+                        if (hasScrollY) targetEl.scrollTop = startScrollTop - dy;
                       }
                     };
                     const onPlayUp = () => {
@@ -1332,9 +1461,12 @@ export const Engine3D: React.FC<Engine3DProps> = ({
                 }
 
                 if (b.locked) return;
-                if (cfg.scrollable) {
+                if (hasAnyScroll) {
                   const boxRect = e.currentTarget.getBoundingClientRect();
-                  if (e.clientX <= boxRect.left + 16 || e.clientX >= boxRect.right - 16) {
+                  const nearVertBar =
+                    hasScrollY && (e.clientX <= boxRect.left + 16 || e.clientX >= boxRect.right - 16);
+                  const nearHorizBar = hasScrollX && e.clientY >= boxRect.bottom - 16;
+                  if (nearVertBar || nearHorizBar) {
                     e.stopPropagation();
                     return;
                   }
@@ -1384,7 +1516,7 @@ export const Engine3D: React.FC<Engine3DProps> = ({
                 }
               }}
               onScroll={() => {
-                if (!isPlaying || !cfg.scrollable) return;
+                if (!isPlaying || !hasAnyScroll) return;
                 const nowMs = performance.now();
                 const last = lastScrollRuleRef.current.get(b.id) ?? 0;
                 if (nowMs - last < 220) return;
@@ -1413,22 +1545,36 @@ export const Engine3D: React.FC<Engine3DProps> = ({
                 borderRadius: `${cfg.boxBorderRadius}px`,
                 padding: `${cfg.boxPadding}px`,
                 textAlign: cfg.align,
-                overscrollBehavior: cfg.scrollable ? 'contain' : undefined,
-                touchAction: cfg.scrollable ? 'pan-y' : undefined,
+                overflowX: hasScrollX ? 'auto' : 'hidden',
+                overflowY: hasScrollY ? 'auto' : 'hidden',
+                overscrollBehavior: hasAnyScroll ? 'contain' : undefined,
+                touchAction:
+                  hasScrollX && hasScrollY
+                    ? 'pan-x pan-y'
+                    : hasScrollX
+                      ? 'pan-x'
+                      : hasScrollY
+                        ? 'pan-y'
+                        : undefined,
               }}
-              className={`absolute pointer-events-auto whitespace-pre-wrap leading-relaxed transition-all duration-100 ${
-                cfg.scrollable ? 'overflow-y-auto' : 'overflow-hidden'
-              } ${
+              className={`absolute pointer-events-auto leading-relaxed transition-all duration-100 ${
                 !isPlaying
                   ? 'cursor-move'
                   : isClickable
                     ? 'cursor-pointer hover:brightness-110 active:scale-95'
-                    : cfg.scrollable
+                    : hasAnyScroll
                       ? 'cursor-grab active:cursor-grabbing'
                       : ''
               }`}
             >
-              {interpolateText(cfg.text)}
+              <BoxLayersRenderer
+                cfg={cfg}
+                assets={project.assets}
+                isPlaying={isPlaying}
+                interpolateText={interpolateText}
+                onTriggerLayerClick={triggerLayerClick}
+                suppressClickRef={suppressNextClickRef}
+              />
             </div>
           );
         })}

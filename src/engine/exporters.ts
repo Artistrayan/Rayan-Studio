@@ -70,7 +70,10 @@ export async function buildStandaloneGameHtml(project: RayanProject): Promise<st
     #stage { position: relative; width: 100vw; height: 100vh; max-width: calc(100vh * ${w} / ${h}); max-height: calc(100vw * ${h} / ${w}); aspect-ratio: ${w} / ${h}; background: #0b0e14; overflow: hidden; box-shadow: 0 20px 60px rgba(0,0,0,0.65); }
     canvas { width: 100%; height: 100%; display: block; }
     #overlay { position: absolute; inset: 0; pointer-events: none; }
-    .hud-box { position: absolute; pointer-events: auto; white-space: pre-wrap; line-height: 1.5; }
+    .hud-box { position: absolute; pointer-events: auto; line-height: 1.5; }
+    .hud-layer-btn { cursor: pointer; transition: transform 0.1s ease, filter 0.1s ease; }
+    .hud-layer-btn:hover { filter: brightness(1.1); }
+    .hud-layer-btn:active { transform: scale(0.95); }
     #touch-bar { position: absolute; left: 16px; right: 16px; bottom: 16px; display: ${isTouch ? 'flex' : 'none'}; justify-content: space-between; align-items: flex-end; pointer-events: none; z-index: 20; }
     .dpad { display: grid; grid-template-columns: repeat(3, 42px); gap: 4px; pointer-events: auto; }
     .touch-group { display: flex; gap: 10px; pointer-events: auto; }
@@ -79,6 +82,11 @@ export async function buildStandaloneGameHtml(project: RayanProject): Promise<st
     #msg-box { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); background: rgba(11,14,20,0.95); border: 1px solid #f59e0b; border-radius: 14px; padding: 20px 28px; text-align: center; display: none; z-index: 30; }
     #msg-box button { margin-top: 12px; padding: 8px 18px; border: none; border-radius: 8px; background: #f59e0b; color: #0b0e14; font-weight: 700; cursor: pointer; }
   </style>
+  <style id="rayan-custom-css">${(resolved.codeFiles || [])
+    .filter((cf) => cf.enabledInRuntime && cf.language === 'css')
+    .map((cf) => cf.content)
+    .join('\n')
+    .replace(/<\/style>/gi, '<\\/style>')}</style>
 </head>
 <body>
   <div id="stage">
@@ -197,7 +205,14 @@ export async function buildStandaloneGameHtml(project: RayanProject): Promise<st
       } catch {}
     }
 
+    function interpolateText(raw, lvl) {
+      let txt = String(raw || '').replace(/\\{score\\}/g, state.score).replace(/\\{health\\}/g, state.health).replace(/\\{time\\}/g, Math.floor(state.elapsed)).replace(/\\{level\\}/g, lvl);
+      Object.keys(state.custom).forEach(k => { txt = txt.split('{' + k + '}').join(String(state.custom[k])); });
+      return txt;
+    }
+
     const overlayEls = new Map();
+    let suppressBoxClick = false;
     function renderOverlay() {
       const sc = state.scene;
       const lvl = (PROJECT.scenes || []).findIndex(s => s.id === sc.id) + 1 || 1;
@@ -210,6 +225,9 @@ export async function buildStandaloneGameHtml(project: RayanProject): Promise<st
       hudBodies.forEach(b => {
         const cfg = b.textConfig; if (!cfg) return;
         let div = overlayEls.get(b.id);
+        const hasScrollX = Boolean(cfg.scrollableX);
+        const hasScrollY = Boolean(cfg.scrollable);
+        const hasAnyScroll = hasScrollX || hasScrollY;
         const hasClickRule = sc.rules.some(r => r.enabled && r.triggerType === 'on-click' && r.targetName === b.name);
         const isClickable = Boolean(cfg.clickable || b.clickable || hasClickRule);
         if (!div) {
@@ -222,12 +240,37 @@ export async function buildStandaloneGameHtml(project: RayanProject): Promise<st
           div.style.borderRadius = cfg.boxBorderRadius + 'px';
           div.style.padding = cfg.boxPadding + 'px';
           div.style.textAlign = cfg.align;
-          div.style.overflowY = cfg.scrollable ? 'auto' : 'hidden';
-          div.style.overscrollBehavior = cfg.scrollable ? 'contain' : 'auto';
+          div.style.overflowX = hasScrollX ? 'auto' : 'hidden';
+          div.style.overflowY = hasScrollY ? 'auto' : 'hidden';
+          div.style.overscrollBehavior = hasAnyScroll ? 'contain' : 'auto';
           if (b.rotationZ) div.style.transform = 'rotate(' + b.rotationZ + 'deg)';
-          if (cfg.scrollable) {
+          if (hasAnyScroll) {
             let lastSc = 0;
-            div.addEventListener('wheel', ev => ev.stopPropagation(), { passive: true });
+            div.addEventListener('wheel', ev => {
+              ev.stopPropagation();
+              if (((hasScrollX && !hasScrollY) || (hasScrollX && ev.shiftKey)) && ev.deltaY !== 0 && ev.deltaX === 0) {
+                div.scrollLeft += ev.deltaY;
+              }
+            }, { passive: true });
+            div.addEventListener('pointerdown', ev => {
+              const sx = ev.clientX, sy = ev.clientY, sl = div.scrollLeft, st = div.scrollTop;
+              let dragged = false;
+              const onMv = mv => {
+                const dx = mv.clientX - sx, dy = mv.clientY - sy;
+                if (Math.hypot(dx, dy) > 5) {
+                  dragged = true;
+                  if (hasScrollX) div.scrollLeft = sl - dx;
+                  if (hasScrollY) div.scrollTop = st - dy;
+                }
+              };
+              const onUp = () => {
+                if (dragged) { suppressBoxClick = true; setTimeout(() => { suppressBoxClick = false; }, 80); }
+                window.removeEventListener('pointermove', onMv);
+                window.removeEventListener('pointerup', onUp);
+              };
+              window.addEventListener('pointermove', onMv);
+              window.addEventListener('pointerup', onUp);
+            });
             div.addEventListener('scroll', () => {
               const tNow = performance.now();
               if (tNow - lastSc < 220) return;
@@ -239,13 +282,129 @@ export async function buildStandaloneGameHtml(project: RayanProject): Promise<st
             div.style.cursor = 'pointer';
             div.addEventListener('click', ev => {
               ev.stopPropagation();
+              if (suppressBoxClick) return;
               playSfx('click');
               sc.rules.filter(r => r.enabled && r.triggerType === 'on-click' && r.targetName === b.name).forEach(r => runRule(r, 0.016));
             });
           }
+
+          const children = cfg.children || [];
+          if (children.length > 0) {
+            const isH = cfg.layoutDirection === 'horizontal';
+            const wrap = document.createElement('div');
+            wrap.style.display = 'flex';
+            wrap.style.flexDirection = isH ? 'row' : 'column';
+            wrap.style.alignItems = 'stretch';
+            wrap.style.gap = (cfg.childGap ?? 8) + 'px';
+            wrap.style.width = (isH || hasScrollX) ? 'max-content' : '100%';
+            wrap.style.minWidth = '100%';
+            if (cfg.text && cfg.text.trim()) {
+              const headerEl = document.createElement('div');
+              headerEl.dataset.tpl = cfg.text;
+              headerEl.style.flexShrink = '0';
+              headerEl.style.whiteSpace = (hasScrollX && !isH) ? 'pre' : 'pre-wrap';
+              wrap.appendChild(headerEl);
+            }
+            children.forEach(layer => {
+              if (!layer.visible) return;
+              if (layer.kind === 'divider') {
+                const hr = document.createElement('div');
+                hr.style.flexShrink = '0';
+                hr.style.background = layer.borderColor || layer.color || '#334155';
+                hr.style.width = isH ? '1px' : '100%';
+                hr.style.height = isH ? 'auto' : '1px';
+                hr.style.minHeight = isH ? '24px' : '1px';
+                wrap.appendChild(hr);
+                return;
+              }
+              if (layer.kind === 'image') {
+                const imgBox = document.createElement('div');
+                imgBox.style.flexShrink = '0';
+                imgBox.style.width = layer.width ? layer.width + 'px' : (isH ? '84px' : '100%');
+                imgBox.style.height = layer.height ? layer.height + 'px' : '64px';
+                imgBox.style.background = layer.bgColor || 'rgba(15,23,42,0.5)';
+                imgBox.style.border = '1px solid ' + (layer.borderColor || '#334155');
+                imgBox.style.borderRadius = '8px';
+                imgBox.style.overflow = 'hidden';
+                imgBox.style.display = 'flex';
+                imgBox.style.alignItems = 'center';
+                imgBox.style.justifyContent = 'center';
+                const assetObj = layer.assetId ? PROJECT.assets.find(a => a.id === layer.assetId) : null;
+                if (assetObj && assetObj.dataUrl) {
+                  const im = document.createElement('img');
+                  im.src = assetObj.dataUrl;
+                  im.style.width = '100%';
+                  im.style.height = '100%';
+                  im.style.objectFit = 'contain';
+                  im.style.pointerEvents = 'none';
+                  imgBox.appendChild(im);
+                } else {
+                  const sp = document.createElement('span');
+                  sp.dataset.tpl = layer.text || layer.name || 'تصویر';
+                  sp.style.fontSize = '11px';
+                  sp.style.color = '#94a3b8';
+                  imgBox.appendChild(sp);
+                }
+                if (layer.clickable) {
+                  imgBox.className = 'hud-layer-btn';
+                  imgBox.addEventListener('click', ev => {
+                    ev.stopPropagation();
+                    if (suppressBoxClick) return;
+                    playSfx('click');
+                    sc.rules.filter(r => r.enabled && r.triggerType === 'on-click' && r.targetName === layer.name).forEach(r => runRule(r, 0.016));
+                  });
+                }
+                wrap.appendChild(imgBox);
+                return;
+              }
+              const item = document.createElement('div');
+              const isBtn = layer.kind === 'button';
+              const isBadge = layer.kind === 'badge';
+              const isCard = layer.kind === 'card';
+              item.dataset.tpl = layer.text || '';
+              item.style.flexShrink = '0';
+              if (layer.width) item.style.width = layer.width + 'px';
+              else if (isH && isCard) item.style.width = '150px';
+              if (layer.height) item.style.minHeight = layer.height + 'px';
+              item.style.color = layer.color || cfg.textColor;
+              item.style.background = layer.bgColor || 'transparent';
+              item.style.border = '1px solid ' + (layer.borderColor || (isBtn ? '#FCD34D' : '#334155'));
+              item.style.borderRadius = isBadge ? '999px' : '8px';
+              if (layer.fontSize) item.style.fontSize = layer.fontSize + 'px';
+              item.style.padding = '6px 10px';
+              item.style.whiteSpace = 'pre-wrap';
+              item.style.lineHeight = '1.4';
+              if (isBtn || isBadge) {
+                item.style.fontWeight = '700';
+                item.style.textAlign = 'center';
+                item.style.display = 'inline-flex';
+                item.style.alignItems = 'center';
+                item.style.justifyContent = 'center';
+              }
+              if (layer.clickable || isBtn) {
+                item.className = 'hud-layer-btn';
+                item.addEventListener('click', ev => {
+                  ev.stopPropagation();
+                  if (suppressBoxClick) return;
+                  playSfx('click');
+                  sc.rules.filter(r => r.enabled && r.triggerType === 'on-click' && r.targetName === layer.name).forEach(r => runRule(r, 0.016));
+                });
+              }
+              wrap.appendChild(item);
+            });
+            div.appendChild(wrap);
+          } else {
+            const inner = document.createElement('div');
+            inner.dataset.singleText = '1';
+            inner.style.whiteSpace = hasScrollX ? 'pre' : 'pre-wrap';
+            inner.style.width = hasScrollX ? 'max-content' : '100%';
+            div.appendChild(inner);
+          }
+
           overlay.appendChild(div);
           overlayEls.set(b.id, div);
         }
+
         const px = cfg.fixedOnScreen ? b.x : (b.x - state.camX) * camZoom;
         const py = cfg.fixedOnScreen ? b.y : (b.y - state.camY) * camZoom;
         const pw = cfg.fixedOnScreen ? b.width : b.width * camZoom;
@@ -254,9 +413,18 @@ export async function buildStandaloneGameHtml(project: RayanProject): Promise<st
         div.style.top = (py / H * 100) + '%';
         div.style.width = (pw / W * 100) + '%';
         div.style.height = (ph / H * 100) + '%';
-        let txt = cfg.text.replace(/\\{score\\}/g, state.score).replace(/\\{health\\}/g, state.health).replace(/\\{time\\}/g, Math.floor(state.elapsed)).replace(/\\{level\\}/g, lvl);
-        Object.keys(state.custom).forEach(k => { txt = txt.split('{' + k + '}').join(String(state.custom[k])); });
-        if (div.textContent !== txt) div.textContent = txt;
+
+        const dynNodes = div.querySelectorAll('[data-tpl]');
+        if (dynNodes.length > 0) {
+          dynNodes.forEach(node => {
+            const nextTxt = interpolateText(node.getAttribute('data-tpl') || '', lvl);
+            if (node.textContent !== nextTxt) node.textContent = nextTxt;
+          });
+        } else {
+          const single = div.querySelector('[data-single-text]') || div;
+          const nextTxt = interpolateText(cfg.text, lvl);
+          if (single.textContent !== nextTxt) single.textContent = nextTxt;
+        }
       });
     }
 
@@ -351,14 +519,48 @@ export async function buildStandaloneGameHtml(project: RayanProject): Promise<st
         case 'play-sound': playSfx(rule.paramText || 'coin'); break;
         case 'show-message': document.getElementById('msg-text').textContent = rule.paramText || ''; document.getElementById('msg-box').style.display = 'block'; break;
         case 'set-text': if (target && target.textConfig) { target.textConfig.text = rule.paramText || ''; } break;
-        case 'scroll-box': { const el = target ? overlayEls.get(target.id) : null; if (el) el.scrollTop += (rule.paramNumber || 60); break; }
+        case 'scroll-box': {
+          const el = target ? overlayEls.get(target.id) : null;
+          if (el) {
+            if (rule.paramText === 'x') el.scrollLeft += (rule.paramNumber || 60);
+            else el.scrollTop += (rule.paramNumber || 60);
+          }
+          break;
+        }
       }
     }
+
+    const customJsHandles = [];
+    const customApi = {
+      get score() { return state.score; },
+      setScore: v => { state.score = v; },
+      addScore: d => { state.score += d; },
+      get health() { return state.health; },
+      setHealth: v => { state.health = Math.max(0, v); },
+      get vars() { return state.custom; },
+      setVar: (n, v) => { state.custom[n] = v; },
+      get elapsed() { return state.elapsed; },
+      findEntity: name => state.bodies.find(b => b.alive && b.name === name) || null,
+      moveEntity: (name, vx, vy, vz) => { const f = state.bodies.find(b => b.alive && b.name === name); if (f) { f.vx = vx; f.vy = vy; if (vz !== undefined) f.vz = vz; } },
+      setEntityPosition: (name, x, y, z) => { const f = state.bodies.find(b => b.alive && b.name === name); if (f) { f.x = x; f.y = y; if (z !== undefined) f.z = z; } },
+      showMessage: msg => { document.getElementById('msg-text').textContent = String(msg); document.getElementById('msg-box').style.display = 'block'; },
+      playSound: n => playSfx(n),
+      spawnParticles: (x, y, pr) => spawnParticles(x, y, pr || 'sparkle', 18),
+      log: m => console.log('[Rayan]', m)
+    };
+    (PROJECT.codeFiles || []).filter(cf => cf.enabledInRuntime && cf.language === 'javascript').forEach(cf => {
+      try {
+        const fn = new Function('api', '"use strict";\\n' + cf.content + '\\nreturn { onStart: typeof onStart === "function" ? onStart : null, onUpdate: typeof onUpdate === "function" ? onUpdate : null };');
+        const h = fn(customApi);
+        if (h) { customJsHandles.push(h); if (h.onStart) h.onStart(customApi); }
+      } catch (err) { console.error(cf.name, err); }
+    });
 
     let last = performance.now();
     function loop(now) {
       const dt = Math.min((now - last) / 1000, 0.04); last = now;
       state.elapsed += dt;
+      customJsHandles.forEach(h => { try { if (h.onUpdate) h.onUpdate(customApi, dt); } catch {} });
       const sc = state.scene;
       const worldW = Math.max(W, (sc.camera && sc.camera.worldWidth) || W);
       const worldH = Math.max(H, (sc.camera && sc.camera.worldHeight) || H);

@@ -15,8 +15,10 @@ import { RulesAndAiPanel } from './components/RulesAndAiPanel';
 import { AssetsAudioPanel } from './components/AssetsAudioPanel';
 import { ExportView } from './components/ExportView';
 import { PWAInstallButton } from './components/PWAInstallButton';
+import { CodeIdePanel } from './components/CodeIdePanel';
+import { importZipPackage } from './engine/zipHandler';
 
-type StudioTab = 'editor' | 'rules' | 'assets' | 'projects' | 'export';
+type StudioTab = 'editor' | 'code' | 'rules' | 'assets' | 'projects' | 'export';
 
 function synchronizeActiveScene(proj: RayanProject): RayanProject {
   const scenes = proj.scenes.map((sc) =>
@@ -203,6 +205,38 @@ export default function App() {
 
   const handleImportProjectFile = async (file: File) => {
     try {
+      if (file.name.toLowerCase().endsWith('.zip')) {
+        const res = await importZipPackage(file);
+        if (res.importedProject) {
+          const merged = normalizeProject({
+            ...res.importedProject,
+            codeFiles:
+              res.codeFiles.length > 0
+                ? res.codeFiles
+                : res.importedProject.codeFiles,
+            assets:
+              res.assets.length > 0
+                ? [...res.importedProject.assets, ...res.assets]
+                : res.importedProject.assets,
+          });
+          await saveProjectToDb(merged);
+          setProjects((prev) => [merged, ...prev]);
+          resetHistoryForProject(merged);
+          setActiveTab('editor');
+          return;
+        }
+        if (activeProject && (res.codeFiles.length > 0 || res.assets.length > 0)) {
+          handleUpdateActiveProject((prev) => ({
+            ...prev,
+            codeFiles: [...(prev.codeFiles || []), ...res.codeFiles],
+            assets: [...prev.assets, ...res.assets],
+            updatedAt: Date.now(),
+          }));
+          setActiveTab(res.codeFiles.length > 0 ? 'code' : 'assets');
+        }
+        return;
+      }
+
       const text = await file.text();
       const parsed = JSON.parse(text) as RayanProject;
       if (!parsed.entities || !parsed.screenConfig) return;
@@ -219,7 +253,7 @@ export default function App() {
       resetHistoryForProject(imported);
       setActiveTab('editor');
     } catch {
-      // ignore invalid JSON file
+      // ignore invalid file
     }
   };
 
@@ -294,6 +328,7 @@ export default function App() {
           {(
             [
               { id: 'editor', label: 'ویرایشگر صحنه' },
+              { id: 'code', label: 'محیط کدنویسی' },
               { id: 'rules', label: 'قوانین و هوش مصنوعی' },
               { id: 'assets', label: 'فایل‌ها و صدا' },
               { id: 'projects', label: 'پروژه‌ها' },
@@ -347,6 +382,26 @@ export default function App() {
           canRedo={historyMeta.canRedo}
           onUndo={handleUndo}
           onRedo={handleRedo}
+        />
+      )}
+
+      {activeTab === 'code' && (
+        <CodeIdePanel
+          project={activeProject}
+          onUpdateCodeFiles={(nextFiles, extraAssets) =>
+            handleUpdateActiveProject((prev) => ({
+              ...prev,
+              codeFiles: nextFiles,
+              assets: extraAssets && extraAssets.length > 0 ? [...prev.assets, ...extraAssets] : prev.assets,
+              updatedAt: Date.now(),
+            }))
+          }
+          onOpenImportedProject={async (importedProj) => {
+            const normalized = normalizeProject(importedProj);
+            await saveProjectToDb(normalized);
+            setProjects((prev) => [normalized, ...prev]);
+            resetHistoryForProject(normalized);
+          }}
         />
       )}
 
