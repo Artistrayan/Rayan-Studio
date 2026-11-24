@@ -554,11 +554,33 @@ export async function getAssetDependencies(
  */
 export async function retrieveBinaryModel(assetId: string): Promise<RetrievedBinaryModel | null> {
   const record = await getAssetFromDb(assetId);
-  if (!record || !record.buffer) return null;
+  if (!record) return null;
+
+  // Large assets are stored in asset_chunks and intentionally have record.buffer = null.
+  // Reassemble their binary before passing them to Three.js loaders.
+  const buffer =
+    record.buffer && record.buffer.byteLength > 0
+      ? record.buffer
+      : record.chunked
+        ? await readChunksForAsset(await openDb(), assetId)
+        : null;
+
+  if (!buffer || buffer.byteLength === 0) return null;
+  if (record.sizeBytes > 0 && buffer.byteLength !== record.sizeBytes) {
+    throw new Error(
+      `مدل «${record.name}» ناقص بازیابی شد: ${buffer.byteLength} از ${record.sizeBytes} بایت.`
+    );
+  }
+
+  const checksum = await computeSha256Hex(buffer);
+  if (record.checksumSha256 && checksum !== record.checksumSha256) {
+    throw new Error(`اعتبارسنجی فایل مدل «${record.name}» پس از بازیابی ناموفق بود.`);
+  }
+
   const dependencies = await getAssetDependencies(assetId);
   return {
     record,
-    buffer: record.buffer,
+    buffer,
     dependencies,
   };
 }
