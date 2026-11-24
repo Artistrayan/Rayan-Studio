@@ -328,6 +328,7 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
   const boxHelpersMapRef = useRef<Map<string, THREE.BoxHelper>>(new Map());
   const modelObjectsRef = useRef<Map<string, THREE.Group>>(new Map());
   const mixersRef = useRef<Map<string, THREE.AnimationMixer>>(new Map());
+  const autoFramedNodeIdsRef = useRef<Set<string>>(new Set());
   const clockRef = useRef<THREE.Clock>(new THREE.Clock());
   const multiDragSnapshotRef = useRef<MultiDragSnapshot | null>(null);
 
@@ -1684,6 +1685,47 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
         }
         obj.visible = node.visible;
         obj.name = node.name;
+      }
+
+      // Newly imported assets are normalized to a predictable world-space size.
+      // Frame the selected asset once so it cannot remain outside the camera view.
+      scene.updateMatrixWorld(true);
+      const focusedId = selectedIdsRef.current[selectedIdsRef.current.length - 1];
+      const focusedNode = focusedId ? currentMap.get(focusedId) : undefined;
+      if (
+        focusedNode?.kind === 'model-asset' &&
+        !autoFramedNodeIdsRef.current.has(focusedNode.id)
+      ) {
+        const focusedObject = modelObjectsRef.current.get(focusedNode.id);
+        const camera = cameraRef.current;
+        const controls = orbitRef.current;
+        if (focusedObject && camera && controls) {
+          const bounds = new THREE.Box3().setFromObject(focusedObject);
+          if (!bounds.isEmpty()) {
+            const sphere = bounds.getBoundingSphere(new THREE.Sphere());
+            const center = sphere.center;
+            const radius = Math.max(sphere.radius, 0.05);
+            const verticalFov = THREE.MathUtils.degToRad(camera.fov);
+            const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * camera.aspect);
+            const fitDistance =
+              (radius / Math.sin(Math.min(verticalFov, horizontalFov) / 2)) * 1.25;
+            const viewDirection = camera.position.clone().sub(controls.target);
+            if (viewDirection.lengthSq() < 1e-8) viewDirection.set(1, 0.7, 1);
+            viewDirection.normalize();
+
+            controls.target.copy(center);
+            camera.position.copy(center).addScaledVector(viewDirection, fitDistance);
+            camera.near = Math.max(0.01, fitDistance / 100);
+            camera.far = Math.max(1000, fitDistance * 20);
+            camera.updateProjectionMatrix();
+            controls.update();
+            autoFramedNodeIdsRef.current.add(focusedNode.id);
+          } else {
+            setImportError(
+              `مدل «${focusedNode.name}» بارگذاری شد، اما هندسه قابل نمایش ندارد.`
+            );
+          }
+        }
       }
 
       syncTransformGizmoAttachment();
