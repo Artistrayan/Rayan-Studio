@@ -239,6 +239,13 @@ describe('Comprehensive Asset Manager & IndexedDB Storage Tests', () => {
     expect(
       resolveModelDependencyPaths('pack-a/mesh.gltf', ['duplicate.png'], selected)
     ).toEqual([]);
+
+    expect(
+      resolveModelDependencyPaths('pack-a/scene.gltf', ['../shared/texture%20one.png'], [
+        'shared/texture one.png',
+        'pack-b/shared/texture one.png',
+      ])
+    ).toEqual(['shared/texture one.png']);
   });
 
   it('getMimeTypeForAsset returns standard MIME types', () => {
