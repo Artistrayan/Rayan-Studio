@@ -5,8 +5,11 @@ import path from 'path';
 import {defineConfig} from 'vite';
 import {VitePWA} from 'vite-plugin-pwa';
 
+const base = process.env.GITHUB_PAGES === 'true' ? '/Rayan-Studio/' : '/';
+
 export default defineConfig(() => {
   return {
+    base,
     plugins: [
       react(),
       tailwindcss(),
@@ -14,18 +17,18 @@ export default defineConfig(() => {
         registerType: 'autoUpdate',
         includeAssets: ['icon.svg'],
         manifest: {
-          id: '/',
+          id: base,
           name: 'استودیو بازی‌سازی رایان',
           short_name: 'رایان',
           description: 'استودیو بازی‌سازی دوبعدی و سه‌بعدی آفلاین با شبیه‌ساز فیزیک و خروجی وب، اندروید و ویندوز.',
           theme_color: '#0B0E14',
           background_color: '#0B0E14',
           display: 'standalone',
-          start_url: '/',
-          scope: '/',
+          start_url: base,
+          scope: base,
           icons: [
             {
-              src: '/icon.svg',
+              src: `${base}icon.svg`,
               sizes: 'any',
               type: 'image/svg+xml',
               purpose: 'any',
