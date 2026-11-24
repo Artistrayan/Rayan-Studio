@@ -5,6 +5,7 @@ import {
   importAssetFromExternalUrl,
   bakeProceduralPresetToGlbAsset,
   processAndStoreAssetBuffer,
+  resolveModelDependencyPaths,
   updateAssetWithNewFileVersion,
 } from '../src/engine/assetManager';
 import {
@@ -206,6 +207,38 @@ describe('Comprehensive Asset Manager & IndexedDB Storage Tests', () => {
       format: 'glb',
     });
     expect(detectAssetKindAndFormat('unknown.exe')).toBeNull();
+  });
+
+  it('resolves companion resources per model folder and refuses ambiguous basename matches', () => {
+    const selected = [
+      'pack-a/character.gltf',
+      'pack-a/character.bin',
+      'pack-a/textures/body.png',
+      'pack-b/character.gltf',
+      'pack-b/character.bin',
+      'pack-b/textures/body.png',
+      'shared/duplicate.png',
+      'other/duplicate.png',
+    ];
+
+    expect(
+      resolveModelDependencyPaths(
+        'pack-a/character.gltf',
+        ['character.bin', 'textures/body.png', 'https://cdn.example.com/external.png'],
+        selected
+      )
+    ).toEqual(['pack-a/character.bin', 'pack-a/textures/body.png']);
+
+    expect(
+      resolveModelDependencyPaths('pack-a/character.obj', ['character.mtl'], [
+        'pack-a/character.mtl',
+        'pack-b/character.mtl',
+      ])
+    ).toEqual(['pack-a/character.mtl']);
+
+    expect(
+      resolveModelDependencyPaths('pack-a/mesh.gltf', ['duplicate.png'], selected)
+    ).toEqual([]);
   });
 
   it('getMimeTypeForAsset returns standard MIME types', () => {
