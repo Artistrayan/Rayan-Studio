@@ -401,59 +401,57 @@ export async function importAssetsFromFileList(
     if (lower.endsWith('.zip')) {
       try {
         const zip = await JSZip.loadAsync(file);
-        const res = await importZipPackage(file);
-
-        // Also gather any .mtl / .bin / texture entries inside the ZIP for 3D models
-        const zipCompanions: PendingAssetDependencyInput[] = [];
-        for (const entry of Object.values(zip.files)) {
-          if (entry.dir) continue;
-          const base = entry.name.split('/').pop() || entry.name;
-          const ext = base.split('.').pop()?.toLowerCase() || '';
-          if (ext === 'mtl') {
-            zipCompanions.push({
-              relativePath: entry.name,
-              kind: 'material',
-              mimeType: 'text/plain',
-              buffer: await entry.async('arraybuffer'),
-            });
-          } else if (ext === 'bin') {
-            zipCompanions.push({
-              relativePath: entry.name,
-              kind: 'binary',
-              mimeType: 'application/octet-stream',
-              buffer: await entry.async('arraybuffer'),
-            });
-          } else if (['png', 'jpg', 'jpeg', 'webp'].includes(ext)) {
-            zipCompanions.push({
-              relativePath: entry.name,
-              kind: 'texture',
-              mimeType: ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : `image/${ext}`,
-              buffer: await entry.async('arraybuffer'),
-            });
+        const zipEntries = Object.values(zip.files).filter(
+          (entry) =>
+            !entry.dir &&
+            !entry.name.startsWith('__MACOSX/') &&
+            !entry.name.endsWith('.DS_Store')
+        );
+        const virtualFiles: File[] = [];
+        for (const entry of zipEntries) {
+          const entryPath = entry.name.replace(/^\\/+/, '');
+          const extension = entryPath.split('.').pop()?.toLowerCase() || '';
+          if (
+            ['mtl', 'bin', 'png', 'jpg', 'jpeg', 'webp', 'glTF', 'gltf', 'obj', 'fbx', 'usd'].includes(extension)
+          ) {
+            virtualFiles.push(new File([await entry.async('arraybuffer')], entryPath));
           }
         }
 
-        if (res.assets.length === 0) {
-          errors.push(`درون فایل زیپ «${file.name}» دارایی تصویر، مدل سه‌بعدی یا صوتی یافت نشد.`);
-          continue;
-        }
-        for (const zipAsset of res.assets) {
+        let importedCount = 0;
+        for (const entry of zipEntries) {
+          const entryPath = entry.name.replace(/^\\/+/, '');
+          const entryLower = entryPath.toLowerCase();
+          if (entryLower.endsWith('.mtl') || entryLower.endsWith('.bin')) continue;
+          const detected = detectAssetKindAndFormat(entryPath);
+          if (!detected) continue;
+
           try {
-            const buffer = dataUrlToArrayBuffer(zipAsset.dataUrl);
+            const buffer = await entry.async('arraybuffer');
+            const virtualFile = new File([buffer], entryPath);
+            const companionDependencies =
+              detected.kind === 'model3d'
+                ? await collectModelCompanionDependencies(virtualFile, virtualFiles, detected.format)
+                : [];
             const stored = await processAndStoreAssetBuffer({
-              name: zipAsset.name,
-              kind: zipAsset.kind,
-              format: zipAsset.format,
+              name: entryPath.split('/').pop() || entryPath,
+              kind: detected.kind,
+              format: detected.format,
               buffer,
-              tags: ['ZIP'],
-              companionDependencies: zipAsset.kind === 'model3d' ? zipCompanions : [],
+              tags: ['ZIP', ...(companionDependencies.length > 0 ? ['همراه با وابستگی'] : [])],
+              companionDependencies,
             });
             assets.push(stored);
+            importedCount += 1;
           } catch (err) {
             errors.push(
-              `خطا در دارایی «${zipAsset.name}» از زیپ: ${err instanceof Error ? err.message : 'نامعتبر'}`
+              `خطا در دارایی «${entryPath}» از زیپ: ${err instanceof Error ? err.message : 'نامعتبر'}`
             );
           }
+        }
+
+        if (importedCount === 0) {
+          errors.push(`درون فایل زیپ «${file.name}» دارایی تصویر، مدل سه‌بعدی یا صوتی یافت نشد.`);
         }
       } catch (err) {
         errors.push(
