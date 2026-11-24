@@ -1959,7 +1959,7 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
         ref={fileInputRef}
         type="file"
         multiple
-        accept=".glb,.gltf,.fbx,.obj,.stl,.usd,.usdz,.ply"
+        accept=".glb,.gltf,.fbx,.obj,.mtl,.bin,.stl,.usd,.usdz,.ply,.png,.jpg,.jpeg,.webp,.svg,.zip"
         className="hidden"
         onChange={(e) => {
           void handleImport3DFiles(e.target.files);
