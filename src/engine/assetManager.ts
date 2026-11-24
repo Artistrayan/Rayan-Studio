@@ -260,6 +260,126 @@ export interface BatchAssetImportResult {
   errors: string[];
 }
 
+function normalizeAssetReferencePath(path: string): string {
+  let decoded = path.replace(/\\/g, '/').replace(/[?#].*$/, '');
+  try { decoded = decodeURIComponent(decoded); } catch { /* retain malformed path */ }
+  const segments: string[] = [];
+  for (const segment of decoded.split('/')) {
+    if (!segment || segment === '.') continue;
+    if (segment === '..') segments.pop();
+    else segments.push(segment);
+  }
+  return segments.join('/').toLowerCase();
+}
+
+/** Resolve model-relative resources without mixing dependencies from other models. */
+export function resolveModelDependencyPaths(
+  modelPath: string,
+  references: string[],
+  candidatePaths: string[]
+): string[] {
+  const candidates = candidatePaths.map((original) => ({
+    original,
+    normalized: normalizeAssetReferencePath(original),
+  }));
+  const modelDir = normalizeAssetReferencePath(modelPath).split('/').slice(0, -1).join('/');
+  const resolved: string[] = [];
+  for (const reference of references) {
+    if (!reference || /^(data:|https?:|blob:|\/\/)/i.test(reference)) continue;
+    const joined = normalizeAssetReferencePath(modelDir ? modelDir + '/' + reference : reference);
+    let match = candidates.find((candidate) => candidate.normalized === joined);
+    if (!match) {
+      const basename = joined.split('/').pop();
+      const matches = candidates.filter((candidate) => candidate.normalized.split('/').pop() === basename);
+      if (matches.length === 1) match = matches[0];
+    }
+    if (match && !resolved.includes(match.original)) resolved.push(match.original);
+  }
+  return resolved;
+}
+
+function extractObjMaterialReferences(source: string): string[] {
+  return Array.from(source.matchAll(/^\s*mtllib\s+(.+?)\s*$/gim))
+    .flatMap((match) => match[1].trim().split(/\s+/))
+    .filter(Boolean);
+}
+
+function extractMtlTextureReferences(source: string): string[] {
+  const commands = /^(?:map_[a-z0-9_]+|bump|norm|disp|decal)\s+(.+)$/gim;
+  return Array.from(source.matchAll(commands))
+    .map((match) => match[1].trim().split(/\s+/).pop() || '')
+    .filter(Boolean);
+}
+
+function extractGltfResourceReferences(source: string): string[] {
+  let doc: { buffers?: Array<{ uri?: string }>; images?: Array<{ uri?: string }> };
+  try { doc = JSON.parse(source); }
+  catch { throw new Error('ساختار JSON فایل glTF معتبر نیست.'); }
+  return [...(doc.buffers || []), ...(doc.images || [])]
+    .map((resource) => resource.uri || '')
+    .filter(Boolean);
+}
+
+async function collectModelCompanionDependencies(
+  modelFile: File,
+  selectedFiles: File[],
+  format: AssetFormat
+): Promise<PendingAssetDependencyInput[]> {
+  const modelPath = modelFile.webkitRelativePath || modelFile.name;
+  const candidatePaths = selectedFiles.map((file) => file.webkitRelativePath || file.name);
+  let references: string[] = [];
+  if (format === 'gltf') {
+    references = extractGltfResourceReferences(new TextDecoder().decode(await modelFile.arrayBuffer()));
+  } else if (format === 'obj') {
+    references = extractObjMaterialReferences(new TextDecoder().decode(await modelFile.arrayBuffer()));
+  } else if (format === 'fbx') {
+    const source = new TextDecoder().decode(await modelFile.arrayBuffer());
+    references = Array.from(source.matchAll(/["']([^"'\r\n]+\.(?:png|jpe?g|webp|tga|bmp|tif|tiff))["']/gi))
+      .map((match) => match[1]);
+  } else if (format === 'usd') {
+    const source = new TextDecoder().decode(await modelFile.arrayBuffer());
+    references = Array.from(source.matchAll(/@([^@]+\.(?:png|jpe?g|webp|bin|exr|hdr))@/gi))
+      .map((match) => match[1]);
+  }
+
+  const selectedPaths = resolveModelDependencyPaths(modelPath, references, candidatePaths);
+  const byPath = new Map(selectedFiles.map((file) => [file.webkitRelativePath || file.name, file] as const));
+  const dependencies: PendingAssetDependencyInput[] = [];
+  for (const path of selectedPaths) {
+    const file = byPath.get(path);
+    if (!file) continue;
+    const lower = path.toLowerCase();
+    const isMtl = lower.endsWith('.mtl');
+    const isBinary = lower.endsWith('.bin');
+    const extension = lower.split('.').pop() || '';
+    dependencies.push({
+      relativePath: path,
+      kind: isMtl ? 'material' : isBinary ? 'binary' : 'texture',
+      mimeType: isMtl ? 'text/plain' : isBinary ? 'application/octet-stream'
+        : extension === 'jpg' || extension === 'jpeg' ? 'image/jpeg' : 'image/' + extension,
+      buffer: await file.arrayBuffer(),
+    });
+
+    if (isMtl) {
+      const mtlText = new TextDecoder().decode(dependencies[dependencies.length - 1].buffer);
+      const texturePaths = resolveModelDependencyPaths(path, extractMtlTextureReferences(mtlText), candidatePaths);
+      for (const texturePath of texturePaths) {
+        if (dependencies.some((dependency) => dependency.relativePath === texturePath)) continue;
+        const textureFile = byPath.get(texturePath);
+        if (!textureFile) continue;
+        const textureExt = texturePath.toLowerCase().split('.').pop() || '';
+        dependencies.push({
+          relativePath: texturePath,
+          kind: 'texture',
+          mimeType: textureExt === 'jpg' || textureExt === 'jpeg' ? 'image/jpeg' : 'image/' + textureExt,
+          buffer: await textureFile.arrayBuffer(),
+        });
+      }
+    }
+  }
+  return dependencies;
+}
+
 /**
  * Comprehensive multi-file importer:
  * - Pairs .obj with companion .mtl and texture files
@@ -273,48 +393,6 @@ export async function importAssetsFromFileList(
   const assets: RayanAsset[] = [];
   const errors: string[] = [];
 
-  const mtlFiles = files.filter((f) => f.name.toLowerCase().endsWith('.mtl'));
-  const binFiles = files.filter((f) => f.name.toLowerCase().endsWith('.bin'));
-  const hasModelFile = files.some((f) => {
-    const ext = f.name.split('.').pop()?.toLowerCase() || '';
-    return ['obj', 'gltf', 'fbx', 'glb', 'usd', 'usdz'].includes(ext);
-  });
-
-  // Pre-read companion dependencies (.mtl, .bin, and textures when selected alongside an OBJ/glTF/FBX)
-  const companionPool: PendingAssetDependencyInput[] = [];
-  for (const mtl of mtlFiles) {
-    companionPool.push({
-      relativePath: mtl.name,
-      kind: 'material',
-      mimeType: 'text/plain',
-      buffer: await mtl.arrayBuffer(),
-    });
-  }
-  for (const bin of binFiles) {
-    companionPool.push({
-      relativePath: bin.name,
-      kind: 'binary',
-      mimeType: 'application/octet-stream',
-      buffer: await bin.arrayBuffer(),
-    });
-  }
-
-  // If textures were selected together with an OBJ/glTF/FBX model, make them available as dependencies too
-  const pairedTextureNames = new Set<string>();
-  if (hasModelFile) {
-    for (const f of files) {
-      const ext = f.name.split('.').pop()?.toLowerCase() || '';
-      if (['png', 'jpg', 'jpeg', 'webp'].includes(ext)) {
-        companionPool.push({
-          relativePath: f.name,
-          kind: 'texture',
-          mimeType: ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : `image/${ext}`,
-          buffer: await f.arrayBuffer(),
-        });
-        pairedTextureNames.add(f.name);
-      }
-    }
-  }
 
   for (const file of files) {
     const lower = file.name.toLowerCase();
@@ -395,16 +473,17 @@ export async function importAssetsFromFileList(
 
     try {
       const buffer = await file.arrayBuffer();
+      const companionDependencies =
+        detected.kind === 'model3d'
+          ? await collectModelCompanionDependencies(file, files, detected.format)
+          : [];
       const imported = await processAndStoreAssetBuffer({
         name: file.name,
         kind: detected.kind,
         format: detected.format,
         buffer,
-        tags:
-          detected.kind === 'model3d' && companionPool.length > 0
-            ? ['همراه با وابستگی']
-            : undefined,
-        companionDependencies: detected.kind === 'model3d' ? companionPool : [],
+        tags: companionDependencies.length > 0 ? ['همراه با وابستگی'] : undefined,
+        companionDependencies,
       });
       assets.push(imported);
     } catch (err) {
