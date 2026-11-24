@@ -541,25 +541,42 @@ export function normalizeLoadedObject(
   const wrapper = new THREE.Group();
   wrapper.name = obj.name || 'ModelContainer';
 
-  const box = new THREE.Box3().setFromObject(obj);
-  const size = box.getSize(new THREE.Vector3());
-  const center = box.getCenter(new THREE.Vector3());
-  const maxDim = Math.max(size.x, size.y, size.z, 0.001);
-  const scale = 1.5 / maxDim;
+  // Keep the imported hierarchy and its authored transforms intact. Normalize a
+  // dedicated content root instead of rewriting the imported root object's transform.
+  const content = new THREE.Group();
+  content.add(obj);
+  content.updateMatrixWorld(true);
 
-  obj.position.set(-center.x, -box.min.y, -center.z);
-  obj.scale.multiplyScalar(scale);
+  const bounds = new THREE.Box3().setFromObject(content);
+  if (bounds.isEmpty()) {
+    throw new Error('مدل واردشده هیچ هندسه قابل نمایشی ندارد.');
+  }
 
-  const scaledContainer = new THREE.Group();
-  scaledContainer.add(obj);
+  const size = bounds.getSize(new THREE.Vector3());
+  const center = bounds.getCenter(new THREE.Vector3());
+  const dimensions = [size.x, size.y, size.z];
+  if (dimensions.some((value) => !Number.isFinite(value) || value < 0)) {
+    throw new Error('ابعاد هندسی مدل معتبر نیست.');
+  }
 
-  // Recalculate normalized bottom
-  const normBox = new THREE.Box3().setFromObject(scaledContainer);
-  scaledContainer.position.y -= normBox.min.y;
+  const maxDim = Math.max(size.x, size.y, size.z);
+  if (!Number.isFinite(maxDim) || maxDim <= 1e-8) {
+    throw new Error('مدل ابعاد قابل نمایش ندارد.');
+  }
+
+  // Every imported format receives the same predictable world-space size while
+  // preserving its aspect ratio. Existing scene-node transforms remain independent.
+  const uniformScale = 1.5 / maxDim;
+  content.scale.setScalar(uniformScale);
+  content.position.set(
+    -center.x * uniformScale,
+    -bounds.min.y * uniformScale,
+    -center.z * uniformScale
+  );
+  content.updateMatrixWorld(true);
 
   let hasSkeleton = Boolean(options.hasSkeleton);
-
-  scaledContainer.traverse((child) => {
+  content.traverse((child) => {
     if ((child as THREE.Mesh).isMesh) {
       child.castShadow = true;
       child.receiveShadow = true;
@@ -571,9 +588,8 @@ export function normalizeLoadedObject(
     }
   });
 
-  wrapper.add(scaledContainer);
+  wrapper.add(content);
 
-  // Preserve animations & skeleton metadata on the root container
   if (options.animations && options.animations.length > 0) {
     wrapper.userData.animations = options.animations;
   }
