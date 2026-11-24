@@ -409,7 +409,7 @@ export async function importAssetsFromFileList(
         );
         const virtualFiles: File[] = [];
         for (const entry of zipEntries) {
-          const entryPath = entry.name.replace(/^\\/+/, '');
+          const entryPath = entry.name.replace(/^\/+/, '');
           const extension = entryPath.split('.').pop()?.toLowerCase() || '';
           if (
             ['mtl', 'bin', 'png', 'jpg', 'jpeg', 'webp', 'glTF', 'gltf', 'obj', 'fbx', 'usd'].includes(extension)
@@ -420,7 +420,7 @@ export async function importAssetsFromFileList(
 
         let importedCount = 0;
         for (const entry of zipEntries) {
-          const entryPath = entry.name.replace(/^\\/+/, '');
+          const entryPath = entry.name.replace(/^\/+/, '');
           const entryLower = entryPath.toLowerCase();
           if (entryLower.endsWith('.mtl') || entryLower.endsWith('.bin')) continue;
           const detected = detectAssetKindAndFormat(entryPath);
