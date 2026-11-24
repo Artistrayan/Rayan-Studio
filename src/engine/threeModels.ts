@@ -662,10 +662,20 @@ function createDependencyLoadingManager(dependencies: StoredAssetDependency[] = 
 
   if (dependencies.length > 0 && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
     const mapByKey = new Map<string, string>();
+    const normalizeResourcePath = (value: string) => {
+      let decoded = value.split('?')[0].split('#')[0];
+      try {
+        decoded = decodeURIComponent(decoded);
+      } catch {
+        // Keep the raw URL if percent-encoding is malformed.
+      }
+      return decoded.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+    };
+
     dependencies.forEach((dep) => {
       const blobUrl = URL.createObjectURL(new Blob([dep.buffer], { type: dep.mimeType }));
       createdUrls.push(blobUrl);
-      const norm = dep.relativePath.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+      const norm = normalizeResourcePath(dep.relativePath);
       const baseName = norm.split('/').pop() || norm;
       mapByKey.set(norm, blobUrl);
       if (!mapByKey.has(baseName)) {
@@ -674,7 +684,7 @@ function createDependencyLoadingManager(dependencies: StoredAssetDependency[] = 
     });
 
     manager.setURLModifier((url) => {
-      const clean = url.split('?')[0].split('#')[0].replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+      const clean = normalizeResourcePath(url);
       const base = clean.split('/').pop() || clean;
       return mapByKey.get(clean) || mapByKey.get(base) || url;
     });
