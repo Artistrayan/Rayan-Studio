@@ -239,15 +239,51 @@ function getNextImportedModelPosition(
   existingNodes: SceneNode3D[],
   offset = 0
 ): [number, number, number] {
-  const importedCount = existingNodes.filter((node) => node.kind === 'model-asset').length + offset;
-  const columns = 3;
-  const spacing = 2.25;
-  const column = importedCount % columns;
-  const row = Math.floor(importedCount / columns);
+  // Keep every imported model close to the editor's origin. An ever-growing
+  // row/column index pushes later imports outside the initial viewport.
+  const occupied = new Set(
+    existingNodes
+      .filter((node) => node.kind === 'model-asset')
+      .map((node) => {
+        const [x, , z] = node.position;
+        return `${Math.round(x * 100) / 100}:${Math.round(z * 100) / 100}`;
+      })
+  );
+  const spacing = 2.0;
+  const candidates: Array<[number, number]> = [
+    [0, 0],
+    [-spacing, 0],
+    [spacing, 0],
+    [0, -spacing],
+    [0, spacing],
+    [-spacing, -spacing],
+    [spacing, -spacing],
+    [-spacing, spacing],
+    [spacing, spacing],
+    [-2 * spacing, 0],
+    [2 * spacing, 0],
+    [0, -2 * spacing],
+    [0, 2 * spacing],
+    [-2 * spacing, -spacing],
+    [2 * spacing, -spacing],
+    [-2 * spacing, spacing],
+    [2 * spacing, spacing],
+  ];
+  const startAt = Math.max(0, offset);
+  for (let index = startAt; index < candidates.length; index += 1) {
+    const [x, z] = candidates[index];
+    const key = `${x}:${z}`;
+    if (!occupied.has(key)) return [x, 0, z];
+  }
+
+  // Beyond the compact viewport grid, continue in a bounded spiral around origin.
+  const ring = Math.floor((startAt - candidates.length) / 8) + 2;
+  const slot = Math.max(0, startAt - candidates.length) % 8;
+  const angle = (slot / 8) * Math.PI * 2;
   return [
-    Number(((column - 1) * spacing).toFixed(3)),
+    Number((Math.cos(angle) * ring * spacing).toFixed(3)),
     0,
-    Number((row * spacing).toFixed(3)),
+    Number((Math.sin(angle) * ring * spacing).toFixed(3)),
   ];
 }
 
