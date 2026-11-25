@@ -352,6 +352,10 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
 
   const nodesRef = useRef<SceneNode3D[]>(nodes);
   nodesRef.current = nodes;
+  // Keep the latest asset metadata without making the async scene-loader effect
+  // restart and cancel in-flight model parses on every project.assets update.
+  const projectAssetsRef = useRef(project.assets);
+  projectAssetsRef.current = project.assets;
   const selectedIdsRef = useRef<string[]>(selectedIds);
   selectedIdsRef.current = selectedIds;
 
@@ -1624,7 +1628,7 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
               node.metalness ?? 0.25
             );
           } else if (node.kind === 'model-asset' && node.assetId) {
-            const asset: RayanAsset = project.assets.find((a) => a.id === node.assetId) || {
+            const asset: RayanAsset = projectAssetsRef.current.find((a) => a.id === node.assetId) || {
               id: node.assetId,
               name: node.name,
               kind: 'model3d',
@@ -1754,7 +1758,7 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
     return () => {
       isCancelled = true;
     };
-  }, [nodes, project.assets, syncTransformGizmoAttachment]);
+  }, [nodes, syncTransformGizmoAttachment]);
 
   // --- Sync Selection BoxHelpers & TransformControls Attachment ---
   useEffect(() => {
