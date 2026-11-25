@@ -233,6 +233,24 @@ function isEffectiveLocked(nodeId: string, nodeMap: Map<string, SceneNode3D>): b
   return false;
 }
 
+// Allocate imported models into a predictable, visible grid instead of random
+// coordinates. Existing user-authored transforms are never modified.
+function getNextImportedModelPosition(
+  existingNodes: SceneNode3D[],
+  offset = 0
+): [number, number, number] {
+  const importedCount = existingNodes.filter((node) => node.kind === 'model-asset').length + offset;
+  const columns = 3;
+  const spacing = 2.25;
+  const column = importedCount % columns;
+  const row = Math.floor(importedCount / columns);
+  return [
+    Number(((column - 1) * spacing).toFixed(3)),
+    0,
+    Number((row * spacing).toFixed(3)),
+  ];
+}
+
 interface MultiDragSnapshot {
   pivotStartInv: THREE.Matrix4;
   items: Array<{
@@ -1005,8 +1023,7 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
     const id = `node_asset_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
     const parentForNew =
       selectedNode && selectedNode.kind === 'group' ? selectedNode.id : null;
-    const spawnX = Number(((Math.random() - 0.5) * 3).toFixed(2));
-    const spawnZ = Number(((Math.random() - 0.5) * 3).toFixed(2));
+    const [spawnX, spawnY, spawnZ] = getNextImportedModelPosition(nodesRef.current);
 
     const newNode: SceneNode3D = {
       id,
@@ -1014,7 +1031,7 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
       kind: 'model-asset',
       assetId: asset.id,
       format: asset.format.toUpperCase(),
-      position: [spawnX, 0, spawnZ],
+      position: [spawnX, spawnY, spawnZ],
       rotation: [0, 0, 0],
       scale: [1, 1, 1],
       color: '#38bdf8',
@@ -1073,8 +1090,9 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
         }
 
         const nodeId = `node_model_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
-        const spawnX = Number(((Math.random() - 0.5) * 3).toFixed(2));
-        const spawnZ = Number(((Math.random() - 0.5) * 3).toFixed(2));
+        const [spawnX, spawnY, spawnZ] = getNextImportedModelPosition(
+          [...nodesRef.current, ...newNodes],
+        );
 
         await linkAssetToScene(asset.id, project.activeSceneId, nodeId).catch(() => {});
         const linkedAsset: RayanAsset = {
@@ -1090,7 +1108,7 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
           kind: 'model-asset',
           assetId: asset.id,
           format: asset.format.toUpperCase(),
-          position: [spawnX, 0, spawnZ],
+          position: [spawnX, spawnY, spawnZ],
           rotation: [0, 0, 0],
           scale: [1, 1, 1],
           color: '#38bdf8',
