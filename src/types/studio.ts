@@ -106,6 +106,7 @@ export interface SceneNode3D {
   preset?: Model3DPresetType;
   primitiveType?: Primitive3DType;
   assetId?: string;
+  assetKind?: AssetKind;
   format?: string;
   position: [number, number, number];
   rotation: [number, number, number]; // Euler angles in degrees
