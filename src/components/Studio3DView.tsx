@@ -62,9 +62,59 @@ import {
   loadCustom3DAsset,
 } from '../engine/threeModels';
 import { importAssetsFromFileList } from '../engine/assetManager';
-import { linkAssetToScene, unlinkAssetFromScene } from '../storage/projectDb';
+import { linkAssetToScene, retrieveBinaryModel, unlinkAssetFromScene } from '../storage/projectDb';
 
 export type { SceneNode3D };
+
+async function buildImageAssetPlane(asset: RayanAsset): Promise<THREE.Group> {
+  let buffer: ArrayBuffer | null = null;
+  if (asset.dataUrl && !asset.dataUrl.startsWith('idb://')) {
+    const comma = asset.dataUrl.indexOf(',');
+    if (comma >= 0) {
+      const binary = atob(asset.dataUrl.slice(comma + 1));
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+      buffer = bytes.buffer;
+    }
+  }
+  if (!buffer) {
+    const stored = await retrieveBinaryModel(asset.id);
+    buffer = stored?.buffer || null;
+  }
+  if (!buffer) throw new Error(`داده تصویر «${asset.name}» در حافظه پیدا نشد.`);
+
+  const mime = asset.format === 'svg' ? 'image/svg+xml'
+    : asset.format === 'jpg' ? 'image/jpeg' : `image/${asset.format}`;
+  const url = URL.createObjectURL(new Blob([buffer], { type: mime }));
+  try {
+    const texture = await new Promise<THREE.Texture>((resolve, reject) => {
+      new THREE.TextureLoader().load(url, resolve, undefined, reject);
+    });
+    texture.colorSpace = THREE.SRGBColorSpace;
+    texture.needsUpdate = true;
+    const image = texture.image as HTMLImageElement;
+    const aspect = image?.naturalWidth && image?.naturalHeight
+      ? image.naturalWidth / image.naturalHeight : 1;
+    const height = Math.min(3, Math.max(0.25, 2.2 / Math.max(aspect, 0.05)));
+    const width = height * aspect;
+    const group = new THREE.Group();
+    const material = new THREE.MeshBasicMaterial({
+      map: texture,
+      side: THREE.DoubleSide,
+      transparent: asset.format === 'png' || asset.format === 'webp' || asset.format === 'svg',
+      depthWrite: true,
+    });
+    const mesh = new THREE.Mesh(new THREE.PlaneGeometry(width, height), material);
+    mesh.position.y = height / 2;
+    mesh.userData.isImportedImage = true;
+    group.add(mesh);
+    group.userData.assetKind = 'image';
+    group.userData.imageAspect = aspect;
+    return group;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
 
 export interface Studio3DViewProps {
   project: RayanProject;
@@ -1124,12 +1174,12 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
       }
 
       for (const asset of result.assets) {
-        if (asset.kind !== 'model3d') {
+        if (asset.kind === 'audio') {
           await onAddAsset?.(asset);
           continue;
         }
 
-        const nodeId = `node_model_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
+        const nodeId = `node_asset_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
         const [spawnX, spawnY, spawnZ] = getNextImportedModelPosition(
           [...nodesRef.current, ...newNodes],
         );
@@ -1178,7 +1228,7 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
           .filter((a) => a.kind === 'model3d')
           .reduce((sum, a) => sum + (a.modelMeta?.vertexCount || 0), 0);
         setImportStatus(
-          `${newNodes.length} مدل (${totalVerts.toLocaleString()} رأس) در binary_assets ذخیره و به صحنه اضافه شد.`
+          `${newNodes.length} دارایی (مدل و تصویر) ذخیره و به صحنه اضافه شد؛ ${totalVerts.toLocaleString()} رأس مدل سه‌بعدی.`
         );
       } else if (result.assets.length > 0) {
         setImportStatus(`${result.assets.length} دارایی در کتابخانه ذخیره شد.`);
@@ -1664,18 +1714,22 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
               node.metalness ?? 0.25
             );
           } else if (node.kind === 'model-asset' && node.assetId) {
+            const format = (node.format?.toLowerCase() || 'glb') as AssetFormat;
+            const imageFormat = ['png', 'jpg', 'webp', 'svg'].includes(format);
             const asset: RayanAsset = projectAssetsRef.current.find((a) => a.id === node.assetId) || {
               id: node.assetId,
               name: node.name,
-              kind: 'model3d',
-              format: (node.format?.toLowerCase() || 'glb') as AssetFormat,
+              kind: imageFormat ? 'image' : 'model3d',
+              format,
               dataUrl: `idb://${node.assetId}`,
               sizeBytes: 0,
               createdAt: 0,
               storedInIdb: true,
             };
             try {
-              obj = await loadCustom3DAsset(asset, node.color);
+              obj = asset.kind === 'image'
+                ? await buildImageAssetPlane(asset)
+                : await loadCustom3DAsset(asset, node.color);
             } catch (err) {
               setImportError(
                 `خطا در رندر مدل «${node.name}»: ${err instanceof Error ? err.message : 'فایل سه‌بعدی نامعتبر است'}`
