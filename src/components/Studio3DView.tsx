@@ -47,6 +47,7 @@ import {
 } from 'lucide-react';
 import type {
   AssetFormat,
+  AssetKind,
   Model3DPresetType,
   Primitive3DType,
   RayanAsset,
@@ -441,6 +442,8 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
   // Keep the latest asset metadata without making the async scene-loader effect
   // restart and cancel in-flight model parses on every project.assets update.
   const projectAssetsRef = useRef(project.assets);
+  // Keep freshly imported binary metadata available before React project state commits.
+  const sceneAssetCacheRef = useRef<Map<string, RayanAsset>>(new Map());
   projectAssetsRef.current = project.assets;
   const selectedIdsRef = useRef<string[]>(selectedIds);
   selectedIdsRef.current = selectedIds;
@@ -1115,11 +1118,14 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
       selectedNode && selectedNode.kind === 'group' ? selectedNode.id : null;
     const [spawnX, spawnY, spawnZ] = getNextImportedModelPosition(nodesRef.current);
 
+    sceneAssetCacheRef.current.set(asset.id, asset);
+
     const newNode: SceneNode3D = {
       id,
       name: asset.name,
       kind: 'model-asset',
       assetId: asset.id,
+      assetKind: asset.kind,
       format: asset.format.toUpperCase(),
       position: [spawnX, spawnY, spawnZ],
       rotation: [0, 0, 0],
@@ -1179,6 +1185,7 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
           continue;
         }
 
+        sceneAssetCacheRef.current.set(asset.id, asset);
         const nodeId = `node_asset_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
         const [spawnX, spawnY, spawnZ] = getNextImportedModelPosition(
           [...nodesRef.current, ...newNodes],
@@ -1197,6 +1204,7 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
           name: asset.name,
           kind: 'model-asset',
           assetId: asset.id,
+          assetKind: asset.kind,
           format: asset.format.toUpperCase(),
           position: [spawnX, spawnY, spawnZ],
           rotation: [0, 0, 0],
@@ -1715,27 +1723,36 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
             );
           } else if (node.kind === 'model-asset' && node.assetId) {
             const format = (node.format?.toLowerCase() || 'glb') as AssetFormat;
-            const imageFormat = ['png', 'jpg', 'webp', 'svg'].includes(format);
-            const asset: RayanAsset = projectAssetsRef.current.find((a) => a.id === node.assetId) || {
-              id: node.assetId,
-              name: node.name,
-              kind: imageFormat ? 'image' : 'model3d',
-              format,
-              dataUrl: `idb://${node.assetId}`,
-              sizeBytes: 0,
-              createdAt: 0,
-              storedInIdb: true,
-            };
+            const inferredImage = ['png', 'jpg', 'webp', 'svg'].includes(format);
+            const asset: RayanAsset =
+              sceneAssetCacheRef.current.get(node.assetId) ||
+              projectAssetsRef.current.find((a) => a.id === node.assetId) || {
+                id: node.assetId,
+                name: node.name,
+                kind: node.assetKind || (inferredImage ? 'image' : 'model3d'),
+                format,
+                dataUrl: `idb://${node.assetId}`,
+                sizeBytes: 0,
+                createdAt: 0,
+                storedInIdb: true,
+              };
+            if (node.assetKind && asset.kind !== node.assetKind) {
+              throw new Error(`نوع فایل «${node.name}» با اطلاعات دارایی همخوانی ندارد.`);
+            }
             try {
               obj = asset.kind === 'image'
                 ? await buildImageAssetPlane(asset)
                 : await loadCustom3DAsset(asset, node.color);
             } catch (err) {
               setImportError(
-                `خطا در رندر مدل «${node.name}»: ${err instanceof Error ? err.message : 'فایل سه‌بعدی نامعتبر است'}`
+                `خطا در نمایش فایل «${node.name}»: ${err instanceof Error ? err.message : 'فایل نامعتبر یا غیرقابل‌خواندن است'}`
               );
+              // Never replace a failed user asset with a built-in procedural model.
               continue;
             }
+          } else if (node.kind === 'model-asset') {
+            setImportError(`فایل «${node.name}» شناسه یا اطلاعات لازم برای بارگذاری ندارد.`);
+            continue;
           } else {
             obj = buildProceduralPresetGroup(node.preset || 'crate', node.color);
           }
