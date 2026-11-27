@@ -1799,43 +1799,50 @@ export const Studio3DView: React.FC<Studio3DViewProps> = ({
         obj.name = node.name;
       }
 
-      // Newly imported assets are normalized to a predictable world-space size.
-      // Frame the selected asset once so it cannot remain outside the camera view.
+      // Frame every newly imported model/image together. Focusing only the last
+      // selected node made the other imported assets appear to be missing.
       scene.updateMatrixWorld(true);
-      const focusedId = selectedIdsRef.current[selectedIdsRef.current.length - 1];
-      const focusedNode = focusedId ? currentMap.get(focusedId) : undefined;
-      if (
-        focusedNode?.kind === 'model-asset' &&
-        !autoFramedNodeIdsRef.current.has(focusedNode.id)
-      ) {
-        const focusedObject = modelObjectsRef.current.get(focusedNode.id);
+      const pendingFrameNodes = nodes.filter(
+        (node) => node.kind === 'model-asset' && !autoFramedNodeIdsRef.current.has(node.id)
+      );
+      if (pendingFrameNodes.length > 0) {
+        const combinedBounds = new THREE.Box3();
+        const framedIds: string[] = [];
+        for (const node of pendingFrameNodes) {
+          const object = modelObjectsRef.current.get(node.id);
+          if (!object) continue;
+          const bounds = new THREE.Box3().setFromObject(object);
+          if (!bounds.isEmpty()) {
+            combinedBounds.union(bounds);
+            framedIds.push(node.id);
+          }
+        }
         const camera = cameraRef.current;
         const controls = orbitRef.current;
-        if (focusedObject && camera && controls) {
-          const bounds = new THREE.Box3().setFromObject(focusedObject);
-          if (!bounds.isEmpty()) {
-            const sphere = bounds.getBoundingSphere(new THREE.Sphere());
-            const center = sphere.center;
-            const radius = Math.max(sphere.radius, 0.05);
-            const verticalFov = THREE.MathUtils.degToRad(camera.fov);
-            const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * camera.aspect);
-            const fitDistance =
-              (radius / Math.sin(Math.min(verticalFov, horizontalFov) / 2)) * 1.25;
-            const viewDirection = camera.position.clone().sub(controls.target);
-            if (viewDirection.lengthSq() < 1e-8) viewDirection.set(1, 0.7, 1);
-            viewDirection.normalize();
-
-            controls.target.copy(center);
-            camera.position.copy(center).addScaledVector(viewDirection, fitDistance);
-            camera.near = Math.max(0.01, fitDistance / 100);
-            camera.far = Math.max(1000, fitDistance * 20);
-            camera.updateProjectionMatrix();
-            controls.update();
-            autoFramedNodeIdsRef.current.add(focusedNode.id);
-          } else {
-            setImportError(
-              `مدل «${focusedNode.name}» بارگذاری شد، اما هندسه قابل نمایش ندارد.`
-            );
+        if (!combinedBounds.isEmpty() && camera && controls) {
+          const sphere = combinedBounds.getBoundingSphere(new THREE.Sphere());
+          const center = sphere.center;
+          const radius = Math.max(sphere.radius, 0.1);
+          const verticalFov = THREE.MathUtils.degToRad(camera.fov);
+          const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * camera.aspect);
+          const fitDistance =
+            (radius / Math.sin(Math.min(verticalFov, horizontalFov) / 2)) * 1.3;
+          const viewDirection = camera.position.clone().sub(controls.target);
+          if (viewDirection.lengthSq() < 1e-8) viewDirection.set(1, 0.7, 1);
+          viewDirection.normalize();
+          controls.target.copy(center);
+          camera.position.copy(center).addScaledVector(viewDirection, fitDistance);
+          camera.near = Math.max(0.01, fitDistance / 100);
+          camera.far = Math.max(1000, fitDistance * 20);
+          camera.updateProjectionMatrix();
+          controls.update();
+          framedIds.forEach((id) => autoFramedNodeIdsRef.current.add(id));
+        } else if (pendingFrameNodes.length > 0) {
+          const failedNames = pendingFrameNodes
+            .filter((node) => !modelObjectsRef.current.has(node.id))
+            .map((node) => node.name);
+          if (failedNames.length > 0) {
+            setImportError(`دارایی‌های زیر هنوز در صحنه بارگذاری نشده‌اند: ${failedNames.join('، ')}`);
           }
         }
       }
